@@ -269,3 +269,86 @@ def test_robot_client_registers_builtin_robot_types():
             f"Ensure the corresponding module is imported in robot_client.py. "
             f"Known choices: {sorted(known_choices)}"
         )
+
+
+def _action_validation_client(action_key_sets):
+    import logging
+    import threading
+
+    from lerobot.async_inference.robot_client import RobotClient
+
+    client = object.__new__(RobotClient)
+    client._action_key_sets = action_key_sets
+    client._default_action_keys = ()
+    client._uses_configured_action_key_sets = True
+    client._active_action_dim = None
+    client.action_queue = Queue()
+    client.action_queue_lock = threading.Lock()
+    client.shutdown_event = threading.Event()
+    client.logger = logging.getLogger("test_action_validation_client")
+    return client
+
+
+def test_action_key_sets_support_subset_actions():
+    from lerobot.async_inference.helpers import TimedAction
+
+    action_keys = tuple(f"joint_{index}.pos" for index in range(14))
+    client = _action_validation_client(
+        {14: action_keys, 18: (*action_keys, "x.vel", "y.vel", "theta.vel", "lift")}
+    )
+    action = torch.arange(14, dtype=torch.float32)
+
+    assert client._accept_action_chunk([TimedAction(timestamp=0, timestep=0, action=action)])
+    assert client._action_tensor_to_action_dict(action) == {
+        key: float(index) for index, key in enumerate(action_keys)
+    }
+
+
+def test_action_key_sets_reject_unknown_or_changed_dimensions():
+    from lerobot.async_inference.helpers import TimedAction
+
+    client = _action_validation_client(
+        {
+            14: tuple(f"joint_{index}.pos" for index in range(14)),
+            18: tuple(f"key_{index}" for index in range(18)),
+        }
+    )
+
+    assert client._accept_action_chunk([TimedAction(timestamp=0, timestep=0, action=torch.zeros(14))])
+    assert not client._accept_action_chunk([TimedAction(timestamp=1, timestep=1, action=torch.zeros(18))])
+    assert client.shutdown_event.is_set()
+
+
+def test_action_key_sets_reject_unsupported_dimension():
+    from lerobot.async_inference.helpers import TimedAction
+
+    client = _action_validation_client({14: tuple(f"joint_{index}.pos" for index in range(14))})
+
+    assert not client._accept_action_chunk([TimedAction(timestamp=0, timestep=0, action=torch.zeros(15))])
+    assert client.shutdown_event.is_set()
+
+
+def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets(tmp_path):
+    from lerobot.async_inference.alohamini_client import AlohaMiniAsyncClientConfig
+
+    identity_file = tmp_path / "inference_key"
+    identity_file.touch()
+    cfg = AlohaMiniAsyncClientConfig(
+        policy_type="act",
+        pretrained_name_or_path="checkpoint",
+        actions_per_chunk=30,
+        ssh_identity_file=str(identity_file),
+    )
+
+    client_cfg = cfg.make_robot_client_config()
+
+    assert len(client_cfg.action_key_sets[14]) == 14
+    assert len(client_cfg.action_key_sets[18]) == 18
+    assert client_cfg.action_key_sets[18][:14] == client_cfg.action_key_sets[14]
+    assert client_cfg.action_key_sets[18][-4:] == [
+        "x.vel",
+        "y.vel",
+        "theta.vel",
+        "lift_axis.height_mm",
+    ]
+    assert "127.0.0.1:18080" in " ".join(cfg.ssh_command())

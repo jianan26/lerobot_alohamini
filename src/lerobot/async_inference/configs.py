@@ -148,6 +148,13 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Optional action schemas keyed by action-vector dimension. This is useful for
+    # robots whose policy controls only a subset of their available actuators.
+    action_key_sets: dict[int, list[str]] | None = field(
+        default=None,
+        metadata={"help": "Optional action dimension to ordered robot-action-key mapping"},
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -179,6 +186,15 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.action_key_sets is not None:
+            for action_dim, keys in self.action_key_sets.items():
+                if action_dim <= 0:
+                    raise ValueError(f"action key-set dimension must be positive, got {action_dim}")
+                if len(keys) != action_dim:
+                    raise ValueError(f"action key-set for dimension {action_dim} has {len(keys)} keys")
+                if len(set(keys)) != len(keys):
+                    raise ValueError(f"action key-set for dimension {action_dim} contains duplicate keys")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -200,4 +216,5 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "action_key_sets": self.action_key_sets,
         }

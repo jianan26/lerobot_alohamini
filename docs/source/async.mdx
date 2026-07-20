@@ -70,6 +70,30 @@ Importantly,
 
 ## Done! You should see your robot moving around by now 😉
 
+## AlohaMini over SSH
+
+Run the policy server on the inference machine without exposing a gRPC port:
+
+```shell
+conda activate pose_act
+python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080
+```
+
+On the Pi, start the existing AlohaMini Host first, then start the dedicated client. The client creates and owns a local SSH tunnel to the server; `ssh_identity_file` must be a Pi private key authorized for `jianan@183.230.224.121:50210`.
+
+```shell
+conda activate lerobot_alohamini_py312
+lerobot-async-alohamini-client \
+    --ssh_identity_file=/home/pi5/.ssh/lerobot_inference \
+    --policy_type=act \
+    --pretrained_name_or_path=/path/on/server/checkpoint \
+    --actions_per_chunk=30
+```
+
+AlohaMini accepts a fixed 14-D dual-arm action space or the full 18-D action space. In 14-D mode, only the two arms receive new targets; the last base and lift targets remain unchanged. A session rejects any other dimension or a dimension change.
+
+---
+
 ## Async vs. synchronous inference
 
 Synchronous inference relies on interleaving action chunk prediction and action execution. This inherently results in _idle frames_, frames where the robot awaits idle the policy's output: a new action chunk.

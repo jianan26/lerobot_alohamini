@@ -94,6 +94,10 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        self._default_action_keys = tuple(self.robot.action_features)
+        self._uses_configured_action_key_sets = config.action_key_sets is not None
+        self._action_key_sets = self._resolve_action_key_sets(config.action_key_sets)
+        self._active_action_dim: int | None = None
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -139,6 +143,69 @@ class RobotClient:
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    def _resolve_action_key_sets(
+        self, configured_key_sets: dict[int, list[str]] | None
+    ) -> dict[int, tuple[str, ...]]:
+        robot_action_keys = self._default_action_keys
+        if configured_key_sets is None:
+            return {}
+
+        action_key_sets = {action_dim: tuple(keys) for action_dim, keys in configured_key_sets.items()}
+        for action_dim, keys in action_key_sets.items():
+            unknown_keys = set(keys) - set(robot_action_keys)
+            if unknown_keys:
+                raise ValueError(
+                    f"Action key-set for dimension {action_dim} contains keys not supported by the robot: "
+                    f"{sorted(unknown_keys)}"
+                )
+        return action_key_sets
+
+    def _reject_action_chunk(self, reason: str) -> None:
+        self.logger.error("Rejecting action chunk: %s", reason)
+        with self.action_queue_lock:
+            self.action_queue = Queue()
+        self.shutdown_event.set()
+
+    def _accept_action_chunk(self, timed_actions: list[TimedAction]) -> bool:
+        if not timed_actions:
+            return True
+
+        action_dims = set()
+        for timed_action in timed_actions:
+            action = timed_action.get_action()
+            if action.ndim != 1:
+                self._reject_action_chunk(f"expected 1-D action tensors, got shape {tuple(action.shape)}")
+                return False
+            action_dims.add(action.numel())
+
+        if len(action_dims) != 1:
+            self._reject_action_chunk(f"mixed action dimensions in one chunk: {sorted(action_dims)}")
+            return False
+
+        action_dim = action_dims.pop()
+        if self._uses_configured_action_key_sets and action_dim not in self._action_key_sets:
+            self._reject_action_chunk(
+                f"unsupported action dimension {action_dim}; expected one of {sorted(self._action_key_sets)}"
+            )
+            return False
+        if not self._uses_configured_action_key_sets and action_dim < len(self._default_action_keys):
+            self._reject_action_chunk(
+                f"action dimension {action_dim} is smaller than the robot action dimension "
+                f"{len(self._default_action_keys)}"
+            )
+            return False
+
+        if self._active_action_dim is None:
+            self._active_action_dim = action_dim
+            self.logger.info("Using %d-D policy actions", action_dim)
+        elif self._active_action_dim != action_dim:
+            self._reject_action_chunk(
+                f"action dimension changed from {self._active_action_dim} to {action_dim} during one session"
+            )
+            return False
+
+        return True
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -286,6 +353,9 @@ class RobotClient:
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
 
+                if not self._accept_action_chunk(timed_actions):
+                    break
+
                 # Log device type of received actions
                 if len(timed_actions) > 0:
                     received_device = timed_actions[0].get_action().device.type
@@ -364,8 +434,17 @@ class RobotClient:
             return not self.action_queue.empty()
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
-        action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
-        return action
+        action_dim = action_tensor.numel()
+        action_keys = self._action_key_sets.get(action_dim)
+        if action_keys is None and not self._uses_configured_action_key_sets:
+            action_keys = self._default_action_keys
+        if action_keys is None:
+            raise ValueError(f"No action key-set configured for {action_dim}-D action")
+        if self._active_action_dim != action_dim:
+            raise ValueError(
+                f"Action dimension {action_dim} does not match active session dimension {self._active_action_dim}"
+            )
+        return {key: action_tensor[i].item() for i, key in enumerate(action_keys)}
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
@@ -481,35 +560,41 @@ class RobotClient:
         return _captured_observation, _performed_action
 
 
-@draccus.wrap()
-def async_client(cfg: RobotClientConfig):
+def run_robot_client(
+    cfg: RobotClientConfig,
+    on_started: Callable[[RobotClient], None] | None = None,
+) -> bool:
     logging.info(pformat(asdict(cfg)))
-
-    # TODO: Assert if checking robot support is still needed with the plugin system
-    # if cfg.robot.type not in SUPPORTED_ROBOTS:
-    #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
-
     client = RobotClient(cfg)
 
-    if client.start():
+    try:
+        if not client.start():
+            return False
+
         client.logger.info("Starting action receiver thread...")
-
-        # Create and start action receiver thread
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
-
-        # Start action receiver thread
         action_receiver_thread.start()
 
-        try:
-            # The main thread runs the control loop
-            client.control_loop(task=cfg.task)
+        if on_started is not None:
+            on_started(client)
 
+        try:
+            client.control_loop(task=cfg.task)
         finally:
             client.stop()
             action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")
+        return True
+    finally:
+        if client.running:
+            client.stop()
+
+
+@draccus.wrap()
+def async_client(cfg: RobotClientConfig):
+    run_robot_client(cfg)
 
 
 if __name__ == "__main__":
