@@ -20,7 +20,8 @@ Edit LeRobot datasets using various transformation tools.
 Requires: pip install 'lerobot[dataset]'
 
 This script allows you to delete episodes, split datasets, merge datasets,
-remove features, modify tasks, recompute stats, and convert image datasets to video format.
+remove features, replace actions with next states, modify tasks, recompute stats,
+and convert image datasets to video format.
 When new_repo_id is specified, creates a new dataset.
 
 Path semantics (v2): --root and --new_root are exact dataset folders containing
@@ -107,6 +108,12 @@ Remove camera feature:
         --repo_id lerobot/pusht \
         --operation.type remove_feature \
         --operation.feature_names "['observation.image']"
+
+Replace each action with the next state in the same episode:
+    lerobot-edit-dataset \
+        --repo_id lerobot/pusht \
+        --new_repo_id lerobot/pusht_next_state_actions \
+        --operation.type replace_action
 
 Modify tasks - set a single task for all episodes (WARNING: modifies in-place):
     lerobot-edit-dataset \
@@ -257,6 +264,7 @@ from lerobot.datasets import (
     recompute_stats,
     reencode_dataset,
     remove_feature,
+    replace_action_with_next_state,
     split_dataset,
 )
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -296,6 +304,12 @@ class MergeConfig(OperationConfig):
 @dataclass
 class RemoveFeatureConfig(OperationConfig):
     feature_names: list[str] | None = None
+
+
+@OperationConfig.register_subclass("replace_action")
+@dataclass
+class ReplaceActionConfig(OperationConfig):
+    pass
 
 
 @OperationConfig.register_subclass("modify_tasks")
@@ -543,6 +557,28 @@ def handle_remove_feature(cfg: EditDatasetConfig) -> None:
     if cfg.push_to_hub:
         logging.info(f"Pushing to hub as {output_repo_id}")
         LeRobotDataset(output_repo_id, root=output_dir).push_to_hub()
+
+
+def handle_replace_action(cfg: EditDatasetConfig) -> None:
+    if not isinstance(cfg.operation, ReplaceActionConfig):
+        raise ValueError("Operation config must be ReplaceActionConfig")
+
+    dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    output_repo_id, output_dir = get_output_path(
+        cfg.repo_id,
+        new_repo_id=cfg.new_repo_id,
+        root=cfg.root,
+        new_root=cfg.new_root,
+    )
+    if output_dir == dataset.root:
+        dataset.root = dataset.root.with_name(dataset.root.name + "_old")
+
+    new_dataset = replace_action_with_next_state(dataset, output_dir=output_dir, repo_id=output_repo_id)
+    logging.info(f"Dataset saved to {output_dir}")
+
+    if cfg.push_to_hub:
+        logging.info(f"Pushing to hub as {output_repo_id}")
+        new_dataset.push_to_hub()
 
 
 def handle_modify_tasks(cfg: EditDatasetConfig) -> None:
@@ -830,6 +866,8 @@ def edit_dataset(cfg: EditDatasetConfig) -> None:
         handle_merge(cfg)
     elif operation_type == "remove_feature":
         handle_remove_feature(cfg)
+    elif operation_type == "replace_action":
+        handle_replace_action(cfg)
     elif operation_type == "modify_tasks":
         handle_modify_tasks(cfg)
     elif operation_type == "convert_image_to_video":

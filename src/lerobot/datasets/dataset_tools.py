@@ -484,6 +484,48 @@ def remove_feature(
     )
 
 
+def replace_action_with_next_state(
+    dataset: LeRobotDataset,
+    output_dir: str | Path | None = None,
+    repo_id: str | None = None,
+) -> LeRobotDataset:
+    """Replace each action with the next state in the same episode.
+
+    The final frame of every episode uses its own state because no following
+    state exists. Action and state features must have identical shapes.
+    """
+    if ACTION not in dataset.meta.features or OBS_STATE not in dataset.meta.features:
+        raise ValueError(f"Dataset must contain both '{ACTION}' and '{OBS_STATE}' features")
+    if dataset.meta.features[ACTION]["shape"] != dataset.meta.features[OBS_STATE]["shape"]:
+        raise ValueError("Action and observation.state features must have identical shapes")
+
+    if repo_id is None:
+        repo_id = f"{dataset.repo_id}_replaced_action"
+    output_dir = Path(output_dir) if output_dir is not None else HF_LEROBOT_HOME / repo_id
+
+    new_meta = LeRobotDatasetMetadata.create(
+        repo_id=repo_id,
+        fps=dataset.meta.fps,
+        features=dataset.meta.features,
+        robot_type=dataset.meta.robot_type,
+        root=output_dir,
+        use_videos=len(dataset.meta.video_keys) > 0,
+    )
+    _copy_data_with_replaced_actions(dataset, new_meta)
+    if new_meta.video_keys:
+        _copy_videos(dataset, new_meta)
+
+    new_dataset = LeRobotDataset(
+        repo_id=repo_id,
+        root=output_dir,
+        image_transforms=dataset.image_transforms,
+        delta_timestamps=dataset.delta_timestamps,
+        tolerance_s=dataset.tolerance_s,
+    )
+    recompute_stats(new_dataset)
+    return new_dataset
+
+
 def _fractions_to_episode_indices(
     total_episodes: int,
     splits: dict[str, float],
@@ -1055,6 +1097,35 @@ def _copy_data_with_feature_changes(
         dst_path = new_meta.root / DEFAULT_DATA_PATH.format(chunk_index=chunk_idx, file_index=file_idx)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
 
+        _write_parquet(df, dst_path, new_meta)
+
+    _copy_episodes_metadata_and_stats(dataset, new_meta)
+
+
+def _copy_data_with_replaced_actions(
+    dataset: LeRobotDataset,
+    new_meta: LeRobotDatasetMetadata,
+) -> None:
+    """Copy data files while replacing actions with following episode states."""
+    parquet_files = sorted((dataset.root / DATA_DIR).glob("*/*.parquet"))
+    if not parquet_files:
+        raise ValueError(f"No parquet files found in {dataset.root / DATA_DIR}")
+
+    next_states: dict[int, np.ndarray] = {}
+    for src_path in reversed(parquet_files):
+        df = pd.read_parquet(src_path).reset_index(drop=True)
+        actions = list(df[ACTION])
+
+        for row_idx in range(len(df) - 1, -1, -1):
+            episode_idx = int(df.at[row_idx, "episode_index"])
+            state = np.asarray(df.at[row_idx, OBS_STATE])
+            actions[row_idx] = next_states.get(episode_idx, state)
+            next_states[episode_idx] = state
+
+        df[ACTION] = actions
+        relative_path = src_path.relative_to(dataset.root)
+        dst_path = new_meta.root / relative_path
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
         _write_parquet(df, dst_path, new_meta)
 
     _copy_episodes_metadata_and_stats(dataset, new_meta)

@@ -146,6 +146,15 @@ def main():
         default=True,
         help="Whether to upload the dataset to Hugging Face Hub after recording.",
     )
+    parser.add_argument(
+        "--only_arm",
+        "--only-arm",
+        type=parse_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Record only arm state/action dimensions; exclude base velocity and lift height.",
+    )
 
     args = parser.parse_args()
 
@@ -175,8 +184,20 @@ def main():
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
 
     # === Dataset setup ===
-    action_features = hw_to_dataset_features(robot.action_features, ACTION)
-    obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR)
+    action_features_hw = robot.action_features
+    observation_features_hw = robot.observation_features
+    if args.only_arm:
+        action_features_hw = {
+            key: value for key, value in action_features_hw.items() if key.startswith("arm_")
+        }
+        observation_features_hw = {
+            key: value
+            for key, value in observation_features_hw.items()
+            if key.startswith("arm_") or isinstance(value, tuple)
+        }
+
+    action_features = hw_to_dataset_features(action_features_hw, ACTION)
+    obs_features = hw_to_dataset_features(observation_features_hw, OBS_STR)
     dataset_features = {**action_features, **obs_features}
     dataset_root = Path(args.dataset_root) if args.dataset_root else HF_LEROBOT_HOME / args.dataset_repo_id
 

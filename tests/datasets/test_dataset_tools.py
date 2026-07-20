@@ -34,6 +34,7 @@ from lerobot.datasets.dataset_tools import (
     modify_tasks,
     reencode_dataset,
     remove_feature,
+    replace_action_with_next_state,
     split_dataset,
 )
 from lerobot.datasets.io_utils import load_info
@@ -69,6 +70,34 @@ def sample_dataset(tmp_path, empty_lerobot_dataset_factory):
 
     dataset.finalize()
     return dataset
+
+
+def test_replace_action_with_next_state(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "action": {"dtype": "float32", "shape": (2,), "names": None},
+        "observation.state": {"dtype": "float32", "shape": (2,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "source", features=features)
+    states = [
+        np.array([0, 0], dtype=np.float32),
+        np.array([1, 1], dtype=np.float32),
+        np.array([2, 2], dtype=np.float32),
+        np.array([10, 10], dtype=np.float32),
+        np.array([11, 11], dtype=np.float32),
+    ]
+    for state in states[:3]:
+        dataset.add_frame({"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "a"})
+    dataset.save_episode()
+    for state in states[3:]:
+        dataset.add_frame({"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "b"})
+    dataset.save_episode()
+    dataset.finalize()
+
+    replaced = replace_action_with_next_state(dataset, output_dir=tmp_path / "replaced")
+
+    actions = [frame["action"].numpy() for frame in replaced]
+    np.testing.assert_array_equal(actions, [states[1], states[2], states[2], states[4], states[4]])
+    assert replaced.meta.stats["action"]["mean"].shape == (2,)
 
 
 def test_delete_single_episode(sample_dataset, tmp_path):

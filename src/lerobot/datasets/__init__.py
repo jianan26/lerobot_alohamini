@@ -33,6 +33,7 @@ from .dataset_tools import (
     recompute_stats,
     reencode_dataset,
     remove_feature,
+    replace_action_with_next_state,
     split_dataset,
 )
 from .factory import make_dataset, make_train_eval_datasets, resolve_delta_timestamps
@@ -96,6 +97,7 @@ __all__ = [
     "recompute_stats",
     "reencode_dataset",
     "remove_feature",
+    "replace_action_with_next_state",
     "resolve_delta_timestamps",
     "safe_stop_image_writer",
     "split_dataset",
