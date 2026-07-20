@@ -703,11 +703,13 @@ class AlohaMini(Robot):
         right_pos = {k: v for k, v in action.items() if k.endswith(".pos") and k.startswith("arm_right_") and self.right_bus is not None and k.replace(".pos", "") in self.right_bus.motors}
 
 
-        base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
-
-        base_wheel_goal_vel = self._body_to_wheel_raw(
-            base_goal_vel["x.vel"], base_goal_vel["y.vel"], base_goal_vel["theta.vel"]
-        )
+        base_velocity_keys = ("x.vel", "y.vel", "theta.vel")
+        base_goal_vel = {key: action[key] for key in base_velocity_keys if key in action}
+        base_wheel_goal_vel = None
+        if base_goal_vel:
+            base_wheel_goal_vel = self._body_to_wheel_raw(
+                base_goal_vel["x.vel"], base_goal_vel["y.vel"], base_goal_vel["theta.vel"]
+            )
         prepare_done_t = time.perf_counter()
 
         # Cap goal position when too far away from present position.
@@ -758,7 +760,8 @@ class AlohaMini(Robot):
         if self.right_bus and right_pos:
             self.right_bus.sync_write("Goal_Position", {k.replace(".pos", ""): v for k, v in right_pos.items()})
         right_write_done_t = time.perf_counter()
-        self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
+        if base_wheel_goal_vel is not None:
+            self.left_bus.sync_write("Goal_Velocity", base_wheel_goal_vel)
         base_write_done_t = time.perf_counter()
 
         self.logs["action_timing_ms"] = {
