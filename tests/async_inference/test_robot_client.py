@@ -328,16 +328,13 @@ def test_action_key_sets_reject_unsupported_dimension():
     assert client.shutdown_event.is_set()
 
 
-def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets(tmp_path):
+def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
     from lerobot.async_inference.alohamini_client import AlohaMiniAsyncClientConfig
 
-    identity_file = tmp_path / "inference_key"
-    identity_file.touch()
     cfg = AlohaMiniAsyncClientConfig(
         policy_type="act",
         pretrained_name_or_path="checkpoint",
         actions_per_chunk=30,
-        ssh_identity_file=str(identity_file),
     )
 
     client_cfg = cfg.make_robot_client_config()

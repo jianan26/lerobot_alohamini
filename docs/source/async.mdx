@@ -79,12 +79,11 @@ conda activate pose_act
 python -m lerobot.async_inference.policy_server --host=127.0.0.1 --port=8080
 ```
 
-On the Pi, start the existing AlohaMini Host first, then start the dedicated client. The client creates and owns a local SSH tunnel to the server; `ssh_identity_file` must be a Pi private key authorized for `jianan@183.230.224.121:50210`.
+On the Pi, start the existing AlohaMini Host first, then start the dedicated client. The client creates and owns a local SSH tunnel to the server and uses the Pi user's existing SSH key.
 
 ```shell
 conda activate lerobot_alohamini_py312
 lerobot-async-alohamini-client \
-    --ssh_identity_file=/home/pi5/.ssh/lerobot_inference \
     --policy_type=act \
     --pretrained_name_or_path=/path/on/server/checkpoint \
     --actions_per_chunk=30

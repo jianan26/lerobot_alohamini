@@ -4,7 +4,6 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import draccus
 
@@ -20,8 +19,6 @@ class AlohaMiniAsyncClientConfig:
     policy_type: str = field(metadata={"help": "Policy type running on the inference server"})
     pretrained_name_or_path: str = field(metadata={"help": "Checkpoint path on the inference server"})
     actions_per_chunk: int = field(metadata={"help": "Number of actions requested per inference call"})
-    ssh_identity_file: str = field(metadata={"help": "Pi SSH private key authorized on the inference server"})
-
     task: str = field(default="", metadata={"help": "Policy task instruction"})
     policy_device: str = field(default="cuda", metadata={"help": "Inference-server policy device"})
     fps: int = field(default=30, metadata={"help": "Pi control-loop frequency"})
@@ -45,8 +42,6 @@ class AlohaMiniAsyncClientConfig:
     def __post_init__(self):
         if self.fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
-        if not Path(self.ssh_identity_file).is_file():
-            raise ValueError(f"SSH identity file does not exist: {self.ssh_identity_file}")
 
     def make_robot_client_config(self) -> RobotClientConfig:
         left_arm_keys, right_arm_keys = arm_state_keys_for_robot_model(self.robot_model)
@@ -77,8 +72,6 @@ class AlohaMiniAsyncClientConfig:
         return [
             "ssh",
             "-N",
-            "-i",
-            self.ssh_identity_file,
             "-p",
             str(self.ssh_port),
             "-L",
