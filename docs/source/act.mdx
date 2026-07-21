@@ -64,6 +64,34 @@ lerobot-train \
   --policy.repo_id=${HF_USER}/act_policy
 ```
 
+### Relative actions
+
+ACT can predict offsets from the current robot state instead of absolute actions. Recompute the dataset action
+statistics in relative space first; use the same chunk size as the ACT policy:
+
+```bash
+lerobot-edit-dataset \
+  --repo_id=your_org/your_dataset \
+  --operation.type=recompute_stats \
+  --operation.relative_action=true \
+  --operation.chunk_size=100 \
+  --operation.relative_exclude_joints='["gripper"]' \
+  --push_to_hub=true
+```
+
+Then enable it for training:
+
+```bash
+lerobot-train \
+  --policy.type=act \
+  --dataset.repo_id=your_org/your_dataset \
+  --policy.use_relative_actions=true \
+  --policy.relative_exclude_joints='["gripper"]'
+```
+
+The listed joints remain absolute; all other action dimensions are converted to `action - observation.state`
+before normalization and restored to absolute actions after inference.
+
 ### Training Tips
 
 1. **Start with defaults**: ACT's default hyperparameters work well for most tasks

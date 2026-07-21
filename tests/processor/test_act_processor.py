@@ -23,11 +23,14 @@ import torch
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
     DeviceProcessorStep,
     NormalizerProcessorStep,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
     UnnormalizerProcessorStep,
@@ -73,16 +76,67 @@ def test_make_act_processor_basic():
     assert postprocessor.name == "policy_postprocessor"
 
     # Check steps in preprocessor
-    assert len(preprocessor.steps) == 4
+    assert len(preprocessor.steps) == 5
     assert isinstance(preprocessor.steps[0], RenameObservationsProcessorStep)
     assert isinstance(preprocessor.steps[1], AddBatchDimensionProcessorStep)
-    assert isinstance(preprocessor.steps[2], DeviceProcessorStep)
-    assert isinstance(preprocessor.steps[3], NormalizerProcessorStep)
+    assert isinstance(preprocessor.steps[2], RelativeActionsProcessorStep)
+    assert isinstance(preprocessor.steps[3], DeviceProcessorStep)
+    assert isinstance(preprocessor.steps[4], NormalizerProcessorStep)
 
     # Check steps in postprocessor
-    assert len(postprocessor.steps) == 2
+    assert len(postprocessor.steps) == 3
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
-    assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+    assert isinstance(postprocessor.steps[1], AbsoluteActionsProcessorStep)
+    assert isinstance(postprocessor.steps[2], DeviceProcessorStep)
+
+
+def test_act_relative_actions_roundtrip_with_gripper_excluded():
+    """ACT converts selected action dimensions to relative values and restores absolute actions."""
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
+
+    observation = {OBS_STATE: torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0])}
+    action = torch.tensor([3.0, 5.0, 7.0, 9.0])
+    batch = transition_to_batch(create_transition(observation, action))
+
+    processed = preprocessor(batch)
+    expected_relative = torch.tensor([[2.0, 3.0, 4.0, 9.0]])
+    torch.testing.assert_close(processed[ACTION], expected_relative)
+    torch.testing.assert_close(postprocessor(processed[ACTION]), action.unsqueeze(0))
+
+
+def test_act_relative_actions_disabled_keeps_actions_absolute():
+    config = create_default_config()
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
+
+    observation = {OBS_STATE: torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0])}
+    action = torch.tensor([3.0, 5.0, 7.0, 9.0])
+    processed = preprocessor(transition_to_batch(create_transition(observation, action)))
+
+    torch.testing.assert_close(processed[ACTION], action.unsqueeze(0))
+    torch.testing.assert_close(postprocessor(processed[ACTION]), action.unsqueeze(0))
+
+
+def test_act_relative_actions_reconnect_after_loading(tmp_path):
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(config, pretrained_path=tmp_path)
+    relative_step = next(step for step in loaded_preprocessor.steps if isinstance(step, RelativeActionsProcessorStep))
+    absolute_step = next(step for step in loaded_postprocessor.steps if isinstance(step, AbsoluteActionsProcessorStep))
+    assert absolute_step.relative_step is relative_step
+
+    observation = {OBS_STATE: torch.tensor([1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0])}
+    action = torch.tensor([3.0, 5.0, 7.0, 9.0])
+    processed = loaded_preprocessor(transition_to_batch(create_transition(observation, action)))
+    torch.testing.assert_close(loaded_postprocessor(processed[ACTION]), action.unsqueeze(0))
 
 
 def test_act_processor_normalization():
@@ -390,7 +444,7 @@ def test_act_processor_bfloat16_device_float32_normalizer():
     preprocessor.steps = modified_steps
 
     # Verify initial normalizer configuration
-    normalizer_step = preprocessor.steps[3]  # NormalizerProcessorStep
+    normalizer_step = preprocessor.steps[4]  # NormalizerProcessorStep
     assert normalizer_step.dtype == torch.float32
 
     # Create test data
