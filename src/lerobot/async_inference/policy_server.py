@@ -260,8 +260,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         except Empty:  # no observation added to queue in obs_queue_timeout
             return services_pb2.Empty()
 
-        except Exception as e:
-            self.logger.error(f"Error in StreamActions: {e}")
+        except Exception:
+            self.logger.exception("Error in StreamActions")
 
             return services_pb2.Empty()
 
@@ -344,6 +344,19 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.lerobot_features,
             self.policy_image_features,
         )
+        expected_state_dim = self.policy.config.input_features["observation.state"].shape[0]
+        state = observation["observation.state"]
+        if state.shape[-1] < expected_state_dim:
+            raise ValueError(
+                f"Robot provided {state.shape[-1]} state dimensions, "
+                f"but the policy requires {expected_state_dim}."
+            )
+        if state.shape[-1] > expected_state_dim:
+            self.logger.info(
+                f"Robot provided {state.shape[-1]} state dimensions; "
+                f"using the first {expected_state_dim} configured dimensions."
+            )
+            observation["observation.state"] = state[..., :expected_state_dim]
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""
@@ -355,6 +368,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """3. Get action chunk"""
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
+        expected_action_dim = self.policy.config.output_features["action"].shape[0]
+        if action_tensor.shape[-1] < expected_action_dim:
+            raise ValueError(
+                f"Policy returned {action_tensor.shape[-1]} action dimensions, "
+                f"but its config requires {expected_action_dim}."
+            )
+        if action_tensor.shape[-1] > expected_action_dim:
+            self.logger.warning(
+                f"Policy returned {action_tensor.shape[-1]} action dimensions; "
+                f"using the first {expected_action_dim} configured dimensions."
+            )
+            action_tensor = action_tensor[..., :expected_action_dim]
         inference_time = time.perf_counter() - start_inference
         self.logger.info(
             f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"

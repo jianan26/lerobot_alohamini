@@ -1,5 +1,6 @@
 """Run AlohaMini asynchronous inference through an SSH tunnel."""
 
+import socket
 import subprocess
 import threading
 import time
@@ -99,23 +100,35 @@ def _stop_tunnel(tunnel: subprocess.Popen[bytes]) -> None:
         tunnel.wait()
 
 
+def _wait_for_tunnel(tunnel: subprocess.Popen[bytes], local_port: int, timeout_s: float = 10) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if tunnel.poll() is not None:
+            raise RuntimeError(f"SSH tunnel exited with status {tunnel.returncode}")
+        try:
+            with socket.create_connection(("127.0.0.1", local_port), timeout=0.2):
+                return
+        except OSError:
+            time.sleep(0.1)
+
+    raise TimeoutError(f"SSH tunnel did not become ready on 127.0.0.1:{local_port}")
+
+
 @draccus.wrap()
 def main(cfg: AlohaMiniAsyncClientConfig) -> None:
     tunnel = subprocess.Popen(cfg.ssh_command())
-    time.sleep(0.2)
-    if tunnel.poll() is not None:
-        raise RuntimeError(f"SSH tunnel exited with status {tunnel.returncode}")
-
-    def watch_tunnel(client: RobotClient) -> None:
-        def wait_for_tunnel() -> None:
-            tunnel.wait()
-            if client.running:
-                client.logger.error("SSH tunnel exited; stopping the robot client")
-                client.shutdown_event.set()
-
-        threading.Thread(target=wait_for_tunnel, daemon=True).start()
-
     try:
+        _wait_for_tunnel(tunnel, cfg.local_tunnel_port)
+
+        def watch_tunnel(client: RobotClient) -> None:
+            def wait_for_tunnel() -> None:
+                tunnel.wait()
+                if client.running:
+                    client.logger.error("SSH tunnel exited; stopping the robot client")
+                    client.shutdown_event.set()
+
+            threading.Thread(target=wait_for_tunnel, daemon=True).start()
+
         run_robot_client(cfg.make_robot_client_config(), on_started=watch_tunnel)
     finally:
         _stop_tunnel(tunnel)

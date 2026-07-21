@@ -46,7 +46,8 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    dims = min(mask_t.shape[0], actions.shape[-1], state.shape[-1])
+    mask_t = mask_t[:dims]
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
@@ -68,7 +69,8 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
-    dims = mask_t.shape[0]
+    dims = min(mask_t.shape[0], actions.shape[-1], state.shape[-1])
+    mask_t = mask_t[:dims]
     # Align state to the same device/dtype as actions. _last_state is cached before
     # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
     if state.device != actions.device or state.dtype != actions.dtype:
