@@ -209,6 +209,14 @@ class ProcessorStep(ABC):
         """Resets the internal state of the processor step, if any."""
         return None
 
+    def train(self, mode: bool = True) -> ProcessorStep:
+        """Set the processing mode for steps that have training-specific behavior."""
+        return self
+
+    def eval(self) -> ProcessorStep:
+        """Set the processing mode to evaluation."""
+        return self.train(False)
+
     @abstractmethod
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
@@ -298,6 +306,16 @@ class DataProcessorPipeline[TInput, TOutput](HubMixin):
         transition = self.to_transition(data)
         transformed_transition = self._forward(transition)
         return self.to_output(transformed_transition)
+
+    def train(self, mode: bool = True) -> DataProcessorPipeline[TInput, TOutput]:
+        """Set the processing mode for all steps in the pipeline."""
+        for processor_step in self.steps:
+            processor_step.train(mode)
+        return self
+
+    def eval(self) -> DataProcessorPipeline[TInput, TOutput]:
+        """Set the processing mode to evaluation for all steps in the pipeline."""
+        return self.train(False)
 
     def _forward(self, transition: EnvTransition) -> EnvTransition:
         """Executes all processing steps and hooks in sequence.

@@ -569,6 +569,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+        preprocessor.train()
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
@@ -617,6 +618,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
         if is_eval_step:
             policy.eval()
+            preprocessor.eval()
             eval_loss_sum = 0.0
             n_eval_batches = 0
             with torch.no_grad(), accelerator.autocast():
@@ -680,6 +682,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             if is_main_process:
                 step_id = get_step_identifier(step, cfg.steps)
                 logging.info(f"Eval policy at step {step}")
+                preprocessor.eval()
                 with torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_env,  # dict[suite][task_id] -> vec_env

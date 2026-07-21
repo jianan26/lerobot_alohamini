@@ -341,6 +341,10 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if isinstance(policy_cfg, ACTConfig):
+            from .act.processor_act import reconcile_act_data_augmentation_processor
+
+            reconcile_act_data_augmentation_processor(policy_cfg, preprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

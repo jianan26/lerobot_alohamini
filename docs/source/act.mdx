@@ -92,6 +92,23 @@ lerobot-train \
 The listed joints remain absolute; all other action dimensions are converted to `action - observation.state`
 before normalization and restored to absolute actions after inference.
 
+### Training-time augmentation
+
+ACT can augment images and robot state during training:
+
+```bash
+lerobot-train \
+  --policy.type=act \
+  --dataset.repo_id=your_org/your_dataset \
+  --policy.aug='["image", "state"]'
+```
+
+`image` applies mild color augmentation to every camera and additional random crop/rotation to front cameras.
+Camera names containing `left` or `right` (such as `wrist_left` and `wrist_right`) receive color augmentation
+only. `state` adds independent Gaussian noise to each raw state value with standard deviation equal to 1% of that
+dimension's dataset standard deviation. Both augmentations run before the usual mean/std normalization.
+Augmentation is disabled by default and is never used during validation or inference.
+
 ### Training Tips
 
 1. **Start with defaults**: ACT's default hyperparameters work well for most tasks

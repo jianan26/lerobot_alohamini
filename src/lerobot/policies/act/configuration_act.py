@@ -78,6 +78,7 @@ class ACTConfig(PreTrainedConfig):
         dropout: Dropout to use in the transformer layers (see code for details).
         kl_weight: The weight to use for the KL-divergence component of the loss if the variational objective
             is enabled. Loss is then calculated as: `reconstruction_loss + kl_weight * kld_loss`.
+        aug: Optional training-time augmentations. Supported values are `"image"` and `"state"`.
     """
 
     # Input / output structure.
@@ -99,6 +100,9 @@ class ACTConfig(PreTrainedConfig):
             "ACTION": NormalizationMode.MEAN_STD,
         }
     )
+
+    # Training-time augmentations.
+    aug: list[str] = field(default_factory=list)
 
     # Architecture.
     # Vision backbone.
@@ -138,6 +142,12 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        unsupported_augmentations = set(self.aug) - {"image", "state"}
+        if unsupported_augmentations:
+            raise ValueError(
+                f"Unsupported ACT augmentations: {sorted(unsupported_augmentations)}. "
+                "Supported values are 'image' and 'state'."
+            )
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
