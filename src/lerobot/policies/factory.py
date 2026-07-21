@@ -29,6 +29,7 @@ from lerobot.configs import FeatureType, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
+    AddBatchDimensionProcessorStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
     batch_to_transition,
@@ -302,6 +303,26 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        if isinstance(policy_cfg, ACTConfig):
+            from .act.processor_act import get_act_normalization_stats
+
+            preprocessor_overrides = dict(kwargs.get("preprocessor_overrides") or {})
+            stats = kwargs.get("dataset_stats")
+            if stats is None:
+                stats = preprocessor_overrides.get("normalizer_processor", {}).get("stats")
+            if stats is not None:
+                normalization_stats = get_act_normalization_stats(policy_cfg, stats)
+                normalizer_override = dict(preprocessor_overrides.get("normalizer_processor") or {})
+                normalizer_override["stats"] = normalization_stats
+                preprocessor_overrides["normalizer_processor"] = normalizer_override
+                kwargs["preprocessor_overrides"] = preprocessor_overrides
+
+                postprocessor_overrides = dict(kwargs.get("postprocessor_overrides") or {})
+                unnormalizer_override = dict(postprocessor_overrides.get("unnormalizer_processor") or {})
+                unnormalizer_override["stats"] = normalization_stats
+                postprocessor_overrides["unnormalizer_processor"] = unnormalizer_override
+                kwargs["postprocessor_overrides"] = postprocessor_overrides
+
         if isinstance(policy_cfg, GrootConfig):
             from .groot.processor_groot import make_groot_pre_post_processors_from_pretrained
 
@@ -342,9 +363,28 @@ def make_pre_post_processors(
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
         if isinstance(policy_cfg, ACTConfig):
+            from lerobot.processor import RelativeStateProcessorStep
+
             from .act.processor_act import reconcile_act_data_augmentation_processor
 
             reconcile_act_data_augmentation_processor(policy_cfg, preprocessor)
+            relative_state_step = next(
+                (step for step in preprocessor.steps if isinstance(step, RelativeStateProcessorStep)), None
+            )
+            if policy_cfg.use_relative_state and relative_state_step is None:
+                batch_index = next(
+                    index
+                    for index, step in enumerate(preprocessor.steps)
+                    if isinstance(step, AddBatchDimensionProcessorStep)
+                )
+                preprocessor.steps.insert(
+                    batch_index,
+                    RelativeStateProcessorStep(
+                        enabled=True,
+                        exclude_joints=policy_cfg.relative_exclude_joints,
+                        action_names=policy_cfg.action_feature_names,
+                    ),
+                )
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

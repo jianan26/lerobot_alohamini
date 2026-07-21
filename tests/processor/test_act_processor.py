@@ -16,11 +16,13 @@
 """Tests for ACT policy processor."""
 
 import tempfile
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies.act.configuration_act import ACTConfig
 from lerobot.policies.act.processor_act import make_act_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
@@ -31,6 +33,7 @@ from lerobot.processor import (
     DeviceProcessorStep,
     NormalizerProcessorStep,
     RelativeActionsProcessorStep,
+    RelativeStateProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
     UnnormalizerProcessorStep,
@@ -60,8 +63,17 @@ def create_default_stats():
     """Create default dataset statistics for testing."""
     return {
         OBS_STATE: {"mean": torch.zeros(7), "std": torch.ones(7)},
+        f"{OBS_STATE}_relative": {"mean": torch.zeros(7), "std": torch.ones(7)},
         ACTION: {"mean": torch.zeros(4), "std": torch.ones(4)},
+        "action_relative": {"mean": torch.zeros(4), "std": torch.ones(4)},
     }
+
+
+def create_relative_stats():
+    stats = create_default_stats()
+    stats[f"{OBS_STATE}_relative"] = {"mean": torch.ones(7), "std": torch.full((7,), 2.0)}
+    stats["action_relative"] = {"mean": torch.full((4,), 3.0), "std": torch.full((4,), 4.0)}
+    return stats
 
 
 def test_make_act_processor_basic():
@@ -137,6 +149,96 @@ def test_act_relative_actions_reconnect_after_loading(tmp_path):
     action = torch.tensor([3.0, 5.0, 7.0, 9.0])
     processed = loaded_preprocessor(transition_to_batch(create_transition(observation, action)))
     torch.testing.assert_close(loaded_postprocessor(processed[ACTION]), action.unsqueeze(0))
+
+
+def test_act_relative_state_uses_previous_frame_and_excludes_gripper():
+    config = create_default_config()
+    config.use_relative_state = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, _ = make_act_pre_post_processors(config, create_relative_stats())
+
+    state_window = torch.tensor([[[5.0, 7.0, 9.0, 11.0, 0.0, 0.0, 0.0], [2.0, 3.0, 4.0, 6.0, 0.0, 0.0, 0.0]]])
+    batch = transition_to_batch(create_transition({OBS_STATE: state_window}, torch.zeros(1, 4)))
+
+    processed = preprocessor(batch)
+    expected = torch.tensor([[1.0, 1.5, 2.0, 2.5, -0.5, -0.5, -0.5]])
+    torch.testing.assert_close(processed[OBS_STATE], expected)
+
+
+def test_act_relative_state_uses_current_state_after_reset():
+    config = create_default_config()
+    config.use_relative_state = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, _ = make_act_pre_post_processors(config, create_relative_stats())
+
+    first = preprocessor(transition_to_batch(create_transition({OBS_STATE: torch.tensor([5.0, 7.0, 9.0, 11.0, 0.0, 0.0, 0.0])}, torch.zeros(4))))
+    torch.testing.assert_close(first[OBS_STATE], torch.tensor([[-0.5, -0.5, -0.5, 5.0, -0.5, -0.5, -0.5]]))
+
+    second = preprocessor(transition_to_batch(create_transition({OBS_STATE: torch.tensor([2.0, 3.0, 4.0, 6.0, 0.0, 0.0, 0.0])}, torch.zeros(4))))
+    torch.testing.assert_close(second[OBS_STATE], torch.tensor([[1.0, 1.5, 2.0, 2.5, -0.5, -0.5, -0.5]]))
+
+    preprocessor.reset()
+    reset_first = preprocessor(transition_to_batch(create_transition({OBS_STATE: torch.tensor([2.0, 3.0, 4.0, 6.0, 0.0, 0.0, 0.0])}, torch.zeros(4))))
+    torch.testing.assert_close(reset_first[OBS_STATE], torch.tensor([[-0.5, -0.5, -0.5, 2.5, -0.5, -0.5, -0.5]]))
+
+
+def test_act_relative_representations_use_relative_stats():
+    config = create_default_config()
+    config.use_relative_state = True
+    config.use_relative_actions = True
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_relative_stats())
+
+    normalizer = next(step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep))
+    unnormalizer = next(step for step in postprocessor.steps if isinstance(step, UnnormalizerProcessorStep))
+    torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["mean"], torch.ones(7))
+    torch.testing.assert_close(normalizer._tensor_stats[ACTION]["mean"], torch.full((4,), 3.0))
+    torch.testing.assert_close(unnormalizer._tensor_stats[ACTION]["mean"], torch.full((4,), 3.0))
+
+
+def test_act_relative_state_is_added_when_loading_an_older_processor(tmp_path):
+    config = create_default_config()
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    config.use_relative_state = True
+    loaded_preprocessor, _ = make_pre_post_processors(
+        config, pretrained_path=tmp_path, dataset_stats=create_relative_stats()
+    )
+
+    assert any(isinstance(step, RelativeStateProcessorStep) for step in loaded_preprocessor.steps)
+    normalizer = next(step for step in loaded_preprocessor.steps if isinstance(step, NormalizerProcessorStep))
+    torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["mean"], torch.ones(7))
+
+
+def test_act_relative_state_requests_only_a_state_window():
+    config = create_default_config()
+    config.use_relative_state = True
+    config.chunk_size = 2
+    dataset_meta = SimpleNamespace(
+        features={OBS_STATE: {}, "observation.images.top": {}, ACTION: {}},
+        fps=10,
+    )
+
+    assert resolve_delta_timestamps(config, dataset_meta) == {
+        OBS_STATE: [-0.1, 0.0],
+        ACTION: [0.0, 0.1],
+    }
+
+
+@pytest.mark.parametrize(
+    ("relative_state", "relative_actions", "missing_key"),
+    [(True, False, f"{OBS_STATE}_relative"), (False, True, "action_relative")],
+)
+def test_act_relative_representations_require_relative_stats(relative_state, relative_actions, missing_key):
+    config = create_default_config()
+    config.use_relative_state = relative_state
+    config.use_relative_actions = relative_actions
+    stats = create_relative_stats()
+    del stats[missing_key]
+
+    with pytest.raises(ValueError, match=missing_key):
+        make_act_pre_post_processors(config, stats)
 
 
 def test_act_processor_normalization():

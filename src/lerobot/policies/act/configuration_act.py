@@ -88,6 +88,8 @@ class ACTConfig(PreTrainedConfig):
 
     # Relative actions: converts absolute actions to offsets from the current state.
     use_relative_actions: bool = False
+    # Relative state: converts state to the previous-state offset for non-excluded joints.
+    use_relative_state: bool = False
     # Joint names to exclude from relative conversion (kept absolute).
     relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
     # Populated at runtime from dataset metadata by make_policy.
@@ -183,6 +185,10 @@ class ACTConfig(PreTrainedConfig):
     @property
     def observation_delta_indices(self) -> None:
         return None
+
+    @property
+    def relative_state_delta_indices(self) -> list[int] | None:
+        return [-1, 0] if self.use_relative_state else None
 
     @property
     def action_delta_indices(self) -> list:

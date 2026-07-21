@@ -15,6 +15,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+import logging
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,6 +33,7 @@ from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    RelativeStateProcessorStep,
     RenameObservationsProcessorStep,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
@@ -38,12 +41,39 @@ from lerobot.processor import (
 )
 from lerobot.processor.pipeline import ObservationProcessorStep, RobotObservation
 from lerobot.utils.constants import (
+    ACTION,
     OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
 
 from .configuration_act import ACTConfig
+
+
+def get_act_normalization_stats(
+    config: ACTConfig, dataset_stats: dict[str, dict[str, Any]] | None
+) -> dict[str, dict[str, Any]] | None:
+    """Select relative-space statistics for enabled ACT representations."""
+    if not config.use_relative_state and not config.use_relative_actions:
+        return dataset_stats
+    if dataset_stats is None:
+        raise ValueError("ACT relative representations require dataset stats from meta/stats.json.")
+
+    stats = deepcopy(dataset_stats)
+    replacements = (
+        (config.use_relative_state, OBS_STATE, f"{OBS_STATE}_relative"),
+        (config.use_relative_actions, ACTION, "action_relative"),
+    )
+    for enabled, target_key, relative_key in replacements:
+        if not enabled:
+            continue
+        if relative_key not in stats:
+            raise ValueError(
+                f"ACT requires '{relative_key}' in meta/stats.json when the corresponding relative option is enabled."
+            )
+        stats[target_key] = stats[relative_key]
+        logging.info("ACT normalizing %s with stats from '%s'.", target_key, relative_key)
+    return stats
 
 
 @dataclass
@@ -186,18 +216,29 @@ def make_act_pre_post_processors(
         action_names=config.action_feature_names,
     )
 
+    normalization_stats = get_act_normalization_stats(config, dataset_stats)
     normalizer = NormalizerProcessorStep(
         features={**config.input_features, **config.output_features},
         norm_map=config.normalization_mapping,
-        stats=dataset_stats,
+        stats=normalization_stats,
         device=config.device,
     )
-    input_steps = [
-        RenameObservationsProcessorStep(rename_map={}),
-        AddBatchDimensionProcessorStep(),
-        relative_step,
-        DeviceProcessorStep(device=config.device),
-    ]
+    input_steps = [RenameObservationsProcessorStep(rename_map={})]
+    if config.use_relative_state:
+        input_steps.append(
+            RelativeStateProcessorStep(
+                enabled=True,
+                exclude_joints=config.relative_exclude_joints,
+                action_names=config.action_feature_names,
+            )
+        )
+    input_steps.extend(
+        [
+            AddBatchDimensionProcessorStep(),
+            relative_step,
+            DeviceProcessorStep(device=config.device),
+        ]
+    )
     if config.aug:
         input_steps.append(
             ACTDataAugmentationProcessorStep(
@@ -210,7 +251,7 @@ def make_act_pre_post_processors(
     input_steps.append(normalizer)
     output_steps = [
         UnnormalizerProcessorStep(
-            features=config.output_features, norm_map=config.normalization_mapping, stats=dataset_stats
+            features=config.output_features, norm_map=config.normalization_mapping, stats=normalization_stats
         ),
         AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),

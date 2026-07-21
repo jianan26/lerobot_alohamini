@@ -92,6 +92,7 @@ from .relative_action_processor import (
     to_absolute_actions,
     to_relative_actions,
 )
+from .relative_state_processor import RelativeStateProcessorStep, to_relative_state
 from .rename_processor import RenameObservationsProcessorStep, rename_stats
 from .tokenizer_processor import ActionTokenizerProcessorStep, TokenizerProcessorStep
 
@@ -135,6 +136,7 @@ __all__ = [
     "make_default_robot_observation_processor",
     "AbsoluteActionsProcessorStep",
     "RelativeActionsProcessorStep",
+    "RelativeStateProcessorStep",
     "MapDeltaActionToRobotActionStep",
     "MapTensorToDeltaActionDictStep",
     "NewLineTaskProcessorStep",
@@ -170,6 +172,7 @@ __all__ = [
     "TruncatedProcessorStep",
     "to_absolute_actions",
     "to_relative_actions",
+    "to_relative_state",
     "UnnormalizerProcessorStep",
     "VanillaObservationProcessorStep",
 ]
