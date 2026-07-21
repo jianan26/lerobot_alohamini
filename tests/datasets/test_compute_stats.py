@@ -26,12 +26,13 @@ from lerobot.datasets.compute_stats import (
     aggregate_feature_stats,
     aggregate_stats,
     compute_episode_stats,
+    compute_relative_state_stats,
     estimate_num_samples,
     get_feature_stats,
     sample_images,
     sample_indices,
 )
-from lerobot.utils.constants import OBS_IMAGE, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGE, OBS_STATE
 
 
 def mock_load_image_as_numpy(path, dtype, channel_first):
@@ -67,6 +68,22 @@ def test_sample_indices():
     assert indices[0] == 0
     assert indices[-1] == 9
     assert len(indices) == estimate_num_samples(10)
+
+
+def test_compute_relative_state_stats_resets_at_episode_boundaries_and_excludes_gripper():
+    stats = compute_relative_state_stats(
+        {
+            OBS_STATE: [[10.0, 100.0], [7.0, 200.0], [1.0, 300.0], [4.0, 400.0]],
+            "episode_index": [0, 0, 1, 1],
+        },
+        {ACTION: {"names": ["joint_1", "gripper"]}},
+        exclude_joints=["gripper"],
+    )
+
+    np.testing.assert_allclose(stats["min"], [-3.0, 100.0])
+    np.testing.assert_allclose(stats["max"], [3.0, 400.0])
+    np.testing.assert_allclose(stats["mean"], [0.0, 250.0])
+    np.testing.assert_array_equal(stats["count"], [4])
 
 
 @patch("lerobot.datasets.compute_stats.load_image_as_numpy", side_effect=mock_load_image_as_numpy)

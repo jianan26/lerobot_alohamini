@@ -32,6 +32,7 @@ from lerobot.datasets.dataset_tools import (
     merge_datasets,
     modify_features,
     modify_tasks,
+    recompute_stats,
     reencode_dataset,
     remove_feature,
     replace_action_with_next_state,
@@ -72,6 +73,22 @@ def sample_dataset(tmp_path, empty_lerobot_dataset_factory):
     return dataset
 
 
+def test_recompute_stats_adds_relative_keys_without_replacing_absolute_stats(sample_dataset):
+    original_action_stats = {key: value.copy() for key, value in sample_dataset.meta.stats["action"].items()}
+    original_state_stats = {
+        key: value.copy() for key, value in sample_dataset.meta.stats["observation.state"].items()
+    }
+
+    recompute_stats(sample_dataset, relative_action=True, relative_state=True, chunk_size=2)
+
+    assert "action_relative" in sample_dataset.meta.stats
+    assert "observation.state_relative" in sample_dataset.meta.stats
+    for key, value in original_action_stats.items():
+        np.testing.assert_array_equal(sample_dataset.meta.stats["action"][key], value)
+    for key, value in original_state_stats.items():
+        np.testing.assert_array_equal(sample_dataset.meta.stats["observation.state"][key], value)
+
+
 def test_replace_action_with_next_state(tmp_path, empty_lerobot_dataset_factory):
     features = {
         "action": {"dtype": "float32", "shape": (2,), "names": None},
@@ -86,10 +103,14 @@ def test_replace_action_with_next_state(tmp_path, empty_lerobot_dataset_factory)
         np.array([11, 11], dtype=np.float32),
     ]
     for state in states[:3]:
-        dataset.add_frame({"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "a"})
+        dataset.add_frame(
+            {"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "a"}
+        )
     dataset.save_episode()
     for state in states[3:]:
-        dataset.add_frame({"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "b"})
+        dataset.add_frame(
+            {"action": np.full(2, -1, dtype=np.float32), "observation.state": state, "task": "b"}
+        )
     dataset.save_episode()
     dataset.finalize()
 

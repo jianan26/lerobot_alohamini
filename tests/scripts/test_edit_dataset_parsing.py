@@ -27,11 +27,13 @@ from lerobot.scripts.lerobot_edit_dataset import (
     MergeConfig,
     ModifyTasksConfig,
     OperationConfig,
+    RecomputeStatsConfig,
     ReencodeVideosConfig,
     RemoveFeatureConfig,
     ReplaceActionConfig,
     SplitConfig,
     _validate_config,
+    handle_recompute_stats,
 )
 
 
@@ -87,6 +89,34 @@ class TestOperationTypeParsing:
         cfg = parse_cfg(["--operation.type", "delete_episodes"])
         with pytest.raises(ValueError, match="--repo_id is required for delete_episodes"):
             _validate_config(cfg)
+
+    def test_recompute_stats_parses_relative_state(self):
+        cfg = parse_cfg(
+            [
+                "--repo_id",
+                "test/repo",
+                "--operation.type",
+                "recompute_stats",
+                "--operation.relative_state",
+                "true",
+            ]
+        )
+        assert isinstance(cfg.operation, RecomputeStatsConfig)
+        assert cfg.operation.relative_state is True
+
+    def test_recompute_stats_rejects_output_directory(self):
+        cfg = parse_cfg(
+            [
+                "--repo_id",
+                "test/repo",
+                "--new_root",
+                "/tmp/other-dataset",
+                "--operation.type",
+                "recompute_stats",
+            ]
+        )
+        with pytest.raises(ValueError, match="updates meta/stats.json in-place"):
+            handle_recompute_stats(cfg)
 
     @pytest.mark.parametrize(
         "type_name, expected_cls",

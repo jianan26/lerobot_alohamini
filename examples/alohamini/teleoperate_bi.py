@@ -78,11 +78,11 @@ robot_config = AlohaMiniClientConfig(
 )
 bi_cfg = BiSOLeaderConfig(
     left_arm_config=SOLeaderConfig(
-        port="/dev/am_arm_leader_left",
+        port="/dev/ttyACM0",
         arm_profile=args.arm_profile,
     ),
     right_arm_config=SOLeaderConfig(
-        port="/dev/am_arm_leader_right",
+        port="/dev/ttyACM1",
         arm_profile=args.arm_profile,
     ),
     id=args.leader_id,

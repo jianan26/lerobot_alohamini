@@ -671,8 +671,8 @@ def _compute_relative_chunk_batch(
     frame_idx = start_indices[:, None] + offsets[None, :]
     chunks = all_actions[frame_idx].copy()
     states = all_states[start_indices]
-    mask_dim = len(relative_mask)
-    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :]
+    mask_dim = min(len(relative_mask), chunks.shape[-1], states.shape[-1])
+    chunks[:, :, :mask_dim] -= states[:, None, :mask_dim] * relative_mask[None, None, :mask_dim]
     return chunks.reshape(-1, all_actions.shape[1])
 
 
@@ -777,3 +777,43 @@ def compute_relative_action_stats(
     )
 
     return stats
+
+
+def compute_relative_state_stats(
+    hf_dataset,
+    features: dict,
+    exclude_joints: list[str] | None = None,
+) -> dict[str, np.ndarray]:
+    """Compute stats for previous_state - state within each episode.
+
+    The first state of every episode uses itself as its previous state, matching
+    ``RelativeStateProcessorStep`` after a reset. Excluded joints remain absolute.
+    """
+    if exclude_joints is None:
+        exclude_joints = ["gripper"]
+
+    all_states = np.array(hf_dataset[OBS_STATE], dtype=np.float32)
+    episode_indices = np.array(hf_dataset["episode_index"])
+    if len(all_states) < 2:
+        raise ValueError("Cannot compute relative state stats for fewer than 2 frames.")
+
+    action_names = features.get(ACTION, {}).get("names")
+    mask_step = RelativeActionsProcessorStep(
+        enabled=True,
+        exclude_joints=exclude_joints,
+        action_names=action_names,
+    )
+    relative_mask = np.array(mask_step._build_mask(all_states.shape[1]), dtype=bool)
+
+    previous_states = all_states.copy()
+    same_episode = episode_indices[1:] == episode_indices[:-1]
+    previous_states[1:][same_episode] = all_states[:-1][same_episode]
+
+    relative_states = all_states.copy()
+    dims = len(relative_mask)
+    relative_states[:, :dims] = np.where(
+        relative_mask[None, :], previous_states[:, :dims] - all_states[:, :dims], all_states[:, :dims]
+    )
+    stats = RunningQuantileStats()
+    stats.update(relative_states)
+    return stats.get_statistics()

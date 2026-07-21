@@ -174,29 +174,17 @@ Show dataset information without feature details:
         --operation.type info \
         --operation.show_features false
 
-Recompute dataset statistics (saves to lerobot/pusht_recomputed_stats by default):
+Recompute dataset statistics in-place:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type recompute_stats
 
-Recompute stats and save to a specific new repo_id:
-    lerobot-edit-dataset \
-        --repo_id lerobot/pusht \
-        --new_repo_id lerobot/pusht_new_stats \
-        --operation.type recompute_stats
-
-Recompute stats in-place (overwrites original dataset stats):
-    lerobot-edit-dataset \
-        --repo_id lerobot/pusht \
-        --new_repo_id lerobot/pusht \
-        --operation.type recompute_stats \
-        --operation.overwrite true
-
-Recompute stats for relative actions and push to hub:
+Add relative action and state stats, then push to hub:
     lerobot-edit-dataset \
         --repo_id lerobot/pusht \
         --operation.type recompute_stats \
         --operation.relative_action true \
+        --operation.relative_state true \
         --operation.chunk_size 50 \
         --operation.relative_exclude_joints "['gripper']" \
         --operation.num_workers 4 \
@@ -336,10 +324,10 @@ class ConvertImageToVideoConfig(OperationConfig):
 class RecomputeStatsConfig(OperationConfig):
     skip_image_video: bool = True
     relative_action: bool = False
+    relative_state: bool = False
     relative_exclude_joints: list[str] | None = None
     chunk_size: int = 50
     num_workers: int = 0
-    overwrite: bool = False
 
 
 @OperationConfig.register_subclass("reencode_videos")
@@ -686,39 +674,13 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
     if not isinstance(cfg.operation, RecomputeStatsConfig):
         raise ValueError("Operation config must be RecomputeStatsConfig")
 
-    # Determine whether this is an in-place operation
-    output_repo_id, input_root, output_root = _resolve_io_paths(
-        cfg.repo_id,
-        cfg.new_repo_id,
-        cfg.root,
-        cfg.new_root,
-        default_new_repo_id=f"{cfg.repo_id}_recomputed_stats",
-    )
-    in_place = output_root == input_root
-
-    if in_place and not cfg.operation.overwrite:
+    if cfg.new_repo_id or cfg.new_root:
         raise ValueError(
-            f"recompute_stats would overwrite the dataset in-place at {input_root}. "
-            "Pass --operation.overwrite true to allow in-place modification, "
-            "or use --new_repo_id / --new_root to write to a different location. "
-            f"Default output repo_id when neither is set: '{cfg.repo_id}_recomputed_stats'."
+            "recompute_stats updates meta/stats.json in-place; remove --new_repo_id and --new_root."
         )
 
-    if in_place:
-        logging.warning(
-            f"Overwriting dataset stats in-place at {input_root}. The original stats will be lost."
-        )
-        dataset = LeRobotDataset(cfg.repo_id, root=input_root)
-    else:
-        logging.info(f"Copying dataset from {input_root} to {output_root}")
-        if output_root.exists():
-            backup_path = output_root.with_name(output_root.name + "_old")
-            logging.warning(f"Output directory {output_root} already exists. Moving to {backup_path}")
-            if backup_path.exists():
-                shutil.rmtree(backup_path)
-            shutil.move(output_root, backup_path)
-        shutil.copytree(input_root, output_root)
-        dataset = LeRobotDataset(output_repo_id, root=output_root)
+    input_root = (Path(cfg.root) if cfg.root else HF_LEROBOT_HOME / cfg.repo_id).resolve()
+    dataset = LeRobotDataset(cfg.repo_id, root=input_root)
 
     logging.info(f"Recomputing stats for {cfg.repo_id}")
     if cfg.operation.relative_action:
@@ -726,11 +688,14 @@ def handle_recompute_stats(cfg: EditDatasetConfig) -> None:
             f"Relative action stats enabled (chunk_size={cfg.operation.chunk_size}, "
             f"exclude_joints={cfg.operation.relative_exclude_joints})"
         )
+    if cfg.operation.relative_state:
+        logging.info(f"Relative state stats enabled (exclude_joints={cfg.operation.relative_exclude_joints})")
 
     recompute_stats(
         dataset,
         skip_image_video=cfg.operation.skip_image_video,
         relative_action=cfg.operation.relative_action,
+        relative_state=cfg.operation.relative_state,
         relative_exclude_joints=cfg.operation.relative_exclude_joints,
         chunk_size=cfg.operation.chunk_size,
         num_workers=cfg.operation.num_workers,

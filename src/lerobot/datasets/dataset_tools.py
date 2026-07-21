@@ -54,6 +54,7 @@ from .compute_stats import (
     aggregate_stats,
     compute_episode_stats,
     compute_relative_action_stats,
+    compute_relative_state_stats,
 )
 from .dataset_metadata import LeRobotDatasetMetadata
 from .image_writer import write_image
@@ -1634,11 +1635,12 @@ def recompute_stats(
     dataset: LeRobotDataset,
     skip_image_video: bool = True,
     relative_action: bool = False,
+    relative_state: bool = False,
     relative_exclude_joints: list[str] | None = None,
     chunk_size: int = 50,
     num_workers: int = 0,
 ) -> LeRobotDataset:
-    """Recompute stats.json from scratch by iterating all episodes.
+    """Recompute standard stats or add relative-space stats to stats.json.
 
     Args:
         dataset: The LeRobotDataset to recompute stats for.
@@ -1648,6 +1650,8 @@ def recompute_stats(
             iterating all valid action chunks and subtracting the current state.
             This matches the normalization distribution the model sees during
             training with ``use_relative_actions=True``.
+        relative_state: If True, compute state stats from previous_state - state
+            and store them under ``observation.state_relative``.
         relative_exclude_joints: Joint names to exclude from relative conversion when
             relative_action=True. These dims keep absolute stats.
         chunk_size: Action chunk size used for relative stats computation. Should match
@@ -1658,6 +1662,28 @@ def recompute_stats(
     Returns:
         The same dataset with updated stats.
     """
+    if relative_action or relative_state:
+        new_stats = dict(dataset.meta.stats or {})
+        exclude_joints = relative_exclude_joints if relative_exclude_joints is not None else ["gripper"]
+        if relative_action and ACTION in dataset.meta.features and OBS_STATE in dataset.meta.features:
+            new_stats["action_relative"] = compute_relative_action_stats(
+                hf_dataset=dataset.hf_dataset,
+                features=dataset.meta.features,
+                chunk_size=chunk_size,
+                exclude_joints=exclude_joints,
+                num_workers=num_workers,
+            )
+        if relative_state and OBS_STATE in dataset.meta.features:
+            new_stats[f"{OBS_STATE}_relative"] = compute_relative_state_stats(
+                hf_dataset=dataset.hf_dataset,
+                features=dataset.meta.features,
+                exclude_joints=exclude_joints,
+            )
+        write_stats(new_stats, dataset.root)
+        dataset.meta.stats = new_stats
+        logging.info("Relative stats updated successfully")
+        return dataset
+
     features = dataset.meta.features
     meta_keys = {"index", "episode_index", "task_index", "frame_index", "timestamp"}
     numeric_features = {
@@ -1672,22 +1698,6 @@ def recompute_stats(
         features_to_compute = {
             k: v for k, v in features.items() if v["dtype"] != "string" and k not in meta_keys
         }
-
-    # When relative_action is enabled, compute action stats via chunk-based sampling
-    # (matching what the model sees during training) and skip action in the
-    # per-episode pass below.
-    relative_action_stats = None
-    if relative_action and ACTION in features and OBS_STATE in features:
-        if relative_exclude_joints is None:
-            relative_exclude_joints = ["gripper"]
-        relative_action_stats = compute_relative_action_stats(
-            hf_dataset=dataset.hf_dataset,
-            features=features,
-            chunk_size=chunk_size,
-            exclude_joints=relative_exclude_joints,
-            num_workers=num_workers,
-        )
-        features_to_compute.pop(ACTION, None)
 
     logging.info(f"Recomputing stats for features: {list(features_to_compute.keys())}")
 
@@ -1722,9 +1732,6 @@ def recompute_stats(
         return dataset
 
     new_stats = aggregate_stats(all_episode_stats) if all_episode_stats else {}
-
-    if relative_action_stats is not None:
-        new_stats[ACTION] = relative_action_stats
 
     # Merge: keep existing stats for features we didn't recompute
     if dataset.meta.stats:
