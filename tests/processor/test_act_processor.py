@@ -110,8 +110,8 @@ def test_act_single_arm_processor_selects_right_arm_data_and_stats():
     config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(7,))
     config.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(7,))
     stats = {
-        OBS_STATE: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18)},
-        ACTION: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18)},
+        OBS_STATE: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18), "count": torch.tensor([32])},
+        ACTION: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18), "count": torch.tensor([32])},
     }
     preprocessor, _ = make_act_pre_post_processors(config, stats)
 
@@ -148,6 +148,8 @@ def test_act_single_arm_processor_selects_right_arm_data_and_stats():
     expected_stats = torch.arange(7, 14, dtype=torch.float32)
     torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["mean"], expected_stats)
     torch.testing.assert_close(normalizer._tensor_stats[ACTION]["mean"], expected_stats)
+    torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["count"], torch.tensor([32.0]))
+    torch.testing.assert_close(normalizer._tensor_stats[ACTION]["count"], torch.tensor([32.0]))
     assert f"{OBS_IMAGES}.wrist_left" not in processed
     torch.testing.assert_close(processed[f"{OBS_IMAGES}.forward"], forward_image.unsqueeze(0))
     torch.testing.assert_close(processed[f"{OBS_IMAGES}.wrist_right"], right_image.unsqueeze(0))

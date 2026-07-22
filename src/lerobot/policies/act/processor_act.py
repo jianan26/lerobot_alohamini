@@ -128,7 +128,10 @@ def get_act_normalization_stats(
             raise ValueError("ACT single_arm preprocessing requires policy creation from dataset metadata.")
         for key, indices in ((OBS_STATE, state_indices), (ACTION, action_indices)):
             if key in stats:
-                stats[key] = {stat_name: value[..., indices] for stat_name, value in stats[key].items()}
+                stats[key] = {
+                    stat_name: value if stat_name == "count" else value[..., indices]
+                    for stat_name, value in stats[key].items()
+                }
     return stats
 
 
