@@ -24,7 +24,7 @@ import torch
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.act.processor_act import SelectRightArmProcessorStep, make_act_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -39,7 +39,7 @@ from lerobot.processor import (
     UnnormalizerProcessorStep,
 )
 from lerobot.processor.converters import create_transition, transition_to_batch
-from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 
 def create_default_config():
@@ -100,6 +100,57 @@ def test_make_act_processor_basic():
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
     assert isinstance(postprocessor.steps[1], AbsoluteActionsProcessorStep)
     assert isinstance(postprocessor.steps[2], DeviceProcessorStep)
+
+
+def test_act_single_arm_processor_selects_right_arm_data_and_stats():
+    config = create_default_config()
+    config.single_arm = True
+    config._single_arm_state_indices = list(range(7, 14))
+    config._single_arm_action_indices = list(range(7, 14))
+    config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(7,))
+    config.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(7,))
+    stats = {
+        OBS_STATE: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18)},
+        ACTION: {"mean": torch.arange(18, dtype=torch.float32), "std": torch.ones(18)},
+    }
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+
+    selector = next(step for step in preprocessor.steps if isinstance(step, SelectRightArmProcessorStep))
+    assert selector.state_indices == list(range(7, 14))
+    assert selector.action_indices == list(range(7, 14))
+    assert selector.excluded_observation_keys == [f"{OBS_IMAGES}.wrist_left"]
+
+    state = torch.arange(18, dtype=torch.float32)
+    action = torch.arange(36, dtype=torch.float32).reshape(2, 18)
+    forward_image = torch.ones(3, 2, 2)
+    left_image = torch.full((3, 2, 2), 2.0)
+    right_image = torch.full((3, 2, 2), 3.0)
+    processed = preprocessor(
+        transition_to_batch(
+            create_transition(
+                {
+                    OBS_STATE: state,
+                    f"{OBS_IMAGES}.forward": forward_image,
+                    f"{OBS_IMAGES}.wrist_left": left_image,
+                    f"{OBS_IMAGES}.wrist_right": right_image,
+                },
+                action,
+            )
+        )
+    )
+    torch.testing.assert_close(processed[OBS_STATE], torch.zeros(1, 7))
+    torch.testing.assert_close(
+        processed[ACTION],
+        torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], [18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]]),
+    )
+
+    normalizer = next(step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep))
+    expected_stats = torch.arange(7, 14, dtype=torch.float32)
+    torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["mean"], expected_stats)
+    torch.testing.assert_close(normalizer._tensor_stats[ACTION]["mean"], expected_stats)
+    assert f"{OBS_IMAGES}.wrist_left" not in processed
+    torch.testing.assert_close(processed[f"{OBS_IMAGES}.forward"], forward_image.unsqueeze(0))
+    torch.testing.assert_close(processed[f"{OBS_IMAGES}.wrist_right"], right_image.unsqueeze(0))
 
 
 def test_act_relative_actions_roundtrip_with_gripper_excluded():

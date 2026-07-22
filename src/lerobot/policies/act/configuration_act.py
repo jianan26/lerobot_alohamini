@@ -86,6 +86,9 @@ class ACTConfig(PreTrainedConfig):
     chunk_size: int = 100
     n_action_steps: int = 100
 
+    # Train on the seven `arm_right_` state/action dimensions from a bimanual AlohaMini dataset.
+    single_arm: bool = False
+
     # Relative actions: converts absolute actions to offsets from the current state.
     use_relative_actions: bool = False
     # Relative state: converts state to the previous-state offset for non-excluded joints.

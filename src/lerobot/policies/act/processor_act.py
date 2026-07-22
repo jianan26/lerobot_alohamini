@@ -35,11 +35,18 @@ from lerobot.processor import (
     RelativeActionsProcessorStep,
     RelativeStateProcessorStep,
     RenameObservationsProcessorStep,
+    TransitionKey,
     UnnormalizerProcessorStep,
     policy_action_to_transition,
     transition_to_policy_action,
 )
-from lerobot.processor.pipeline import ObservationProcessorStep, RobotObservation
+from lerobot.processor.pipeline import (
+    ObservationProcessorStep,
+    ProcessorStep,
+    ProcessorStepRegistry,
+    RobotObservation,
+)
+from lerobot.types import EnvTransition
 from lerobot.utils.constants import (
     ACTION,
     OBS_STATE,
@@ -50,14 +57,54 @@ from lerobot.utils.constants import (
 from .configuration_act import ACTConfig
 
 
+@ProcessorStepRegistry.register("select_right_arm_processor")
+@dataclass
+class SelectRightArmProcessorStep(ProcessorStep):
+    """Keep selected right-arm dimensions and discard excluded observation keys."""
+
+    state_indices: list[int] = field(default_factory=list)
+    action_indices: list[int] = field(default_factory=list)
+    excluded_observation_keys: list[str] = field(default_factory=list)
+
+    def __call__(self, transition: EnvTransition) -> EnvTransition:
+        processed = transition.copy()
+        observation = processed.get(TransitionKey.OBSERVATION)
+        if observation is not None:
+            observation = dict(observation)
+            for key in self.excluded_observation_keys:
+                observation.pop(key, None)
+            if OBS_STATE in observation:
+                observation[OBS_STATE] = observation[OBS_STATE][..., self.state_indices]
+            processed[TransitionKey.OBSERVATION] = observation
+
+        action = processed.get(TransitionKey.ACTION)
+        if action is not None:
+            processed[TransitionKey.ACTION] = action[..., self.action_indices]
+        return processed
+
+    def get_config(self) -> dict[str, Any]:
+        return {
+            "state_indices": self.state_indices,
+            "action_indices": self.action_indices,
+            "excluded_observation_keys": self.excluded_observation_keys,
+        }
+
+    def transform_features(
+        self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]
+    ) -> dict[PipelineFeatureType, dict[str, PolicyFeature]]:
+        return features
+
+
 def get_act_normalization_stats(
     config: ACTConfig, dataset_stats: dict[str, dict[str, Any]] | None
 ) -> dict[str, dict[str, Any]] | None:
     """Select relative-space statistics for enabled ACT representations."""
-    if not config.use_relative_state and not config.use_relative_actions:
+    if not config.use_relative_state and not config.use_relative_actions and not config.single_arm:
         return dataset_stats
     if dataset_stats is None:
-        raise ValueError("ACT relative representations require dataset stats from meta/stats.json.")
+        if config.use_relative_state or config.use_relative_actions:
+            raise ValueError("ACT relative representations require dataset stats from meta/stats.json.")
+        return None
 
     stats = deepcopy(dataset_stats)
     replacements = (
@@ -73,6 +120,15 @@ def get_act_normalization_stats(
             )
         stats[target_key] = stats[relative_key]
         logging.info("ACT normalizing %s with stats from '%s'.", target_key, relative_key)
+
+    if config.single_arm:
+        state_indices = getattr(config, "_single_arm_state_indices", None)
+        action_indices = getattr(config, "_single_arm_action_indices", None)
+        if state_indices is None or action_indices is None:
+            raise ValueError("ACT single_arm preprocessing requires policy creation from dataset metadata.")
+        for key, indices in ((OBS_STATE, state_indices), (ACTION, action_indices)):
+            if key in stats:
+                stats[key] = {stat_name: value[..., indices] for stat_name, value in stats[key].items()}
     return stats
 
 
@@ -224,6 +280,18 @@ def make_act_pre_post_processors(
         device=config.device,
     )
     input_steps = [RenameObservationsProcessorStep(rename_map={})]
+    if config.single_arm:
+        state_indices = getattr(config, "_single_arm_state_indices", None)
+        action_indices = getattr(config, "_single_arm_action_indices", None)
+        if state_indices is None or action_indices is None:
+            raise ValueError("ACT single_arm preprocessing requires policy creation from dataset metadata.")
+        input_steps.append(
+            SelectRightArmProcessorStep(
+                state_indices=state_indices,
+                action_indices=action_indices,
+                excluded_observation_keys=["observation.images.wrist_left"],
+            )
+        )
     if config.use_relative_state:
         input_steps.append(
             RelativeStateProcessorStep(

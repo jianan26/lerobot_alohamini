@@ -266,6 +266,26 @@ lerobot-train \
   --dataset.video_backend=pyav
 ```
 
+### Right-arm-only training
+
+For a bimanual AlohaMini dataset, train ACT using only the seven `arm_right_` state/action dimensions:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=$HF_USER/am2_bi_test \
+  --policy.type=act \
+  --policy.single_arm=true \
+  --output_dir=outputs/train/act_right_arm \
+  --job_name=act_right_arm \
+  --policy.device=cuda \
+  --wandb.enable=false \
+  --policy.repo_id=$HF_USER/act_right_arm \
+  --dataset.video_backend=pyav
+```
+
+The dataset must contain exactly seven named `arm_right_` fields in both `observation.state` and `action`.
+This option changes training only; `evaluate_bi.py` remains the existing dual-arm evaluation workflow.
+
 ### No local GPU?
 
 Use any cloud GPU provider (e.g. AutoDL, Lambda Labs, Vast.ai). Set up the environment the same way as local, run the same training command, then copy the checkpoint back to your machine for evaluation.

@@ -25,7 +25,7 @@ import torch
 if TYPE_CHECKING:
     from lerobot.datasets import LeRobotDatasetMetadata
 
-from lerobot.configs import FeatureType, PreTrainedConfig
+from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.envs import EnvConfig, env_to_policy_features
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
@@ -40,6 +40,8 @@ from lerobot.processor import (
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import (
     ACTION,
+    OBS_IMAGES,
+    OBS_STATE,
     POLICY_POSTPROCESSOR_DEFAULT_NAME,
     POLICY_PREPROCESSOR_DEFAULT_NAME,
 )
@@ -625,8 +627,54 @@ def make_policy(
     if not cfg.input_features:
         cfg.input_features = {key: ft for key, ft in features.items() if key not in cfg.output_features}
 
+    if isinstance(cfg, ACTConfig) and cfg.single_arm:
+        if ds_meta is None:
+            raise ValueError("ACT single_arm training requires dataset metadata.")
+
+        def get_right_arm_indices(feature_key: str) -> tuple[list[int], list[str]]:
+            feature = ds_meta.features.get(feature_key, {})
+            names = feature.get("names")
+            if names is None:
+                raise ValueError(
+                    f"ACT single_arm training requires named '{feature_key}' dataset features."
+                )
+            indices = [index for index, name in enumerate(names) if str(name).startswith("arm_right_")]
+            if len(indices) != 7:
+                raise ValueError(
+                    "ACT single_arm training requires exactly 7 right-arm dimensions in "
+                    f"'{feature_key}' (names starting with 'arm_right_'), found {len(indices)}: {list(names)}."
+                )
+            return indices, [str(names[index]) for index in indices]
+
+        state_indices, state_names = get_right_arm_indices(OBS_STATE)
+        action_indices, action_names = get_right_arm_indices(ACTION)
+        if state_names != action_names:
+            raise ValueError(
+                "ACT single_arm training requires observation.state and action to use the same "
+                f"right-arm fields, got {state_names} and {action_names}."
+            )
+
+        cfg.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(7,))
+        cfg.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(7,))
+        left_wrist_camera = f"{OBS_IMAGES}.wrist_left"
+        required_cameras = {f"{OBS_IMAGES}.forward", f"{OBS_IMAGES}.wrist_right"}
+        missing_cameras = required_cameras - set(cfg.input_features)
+        if missing_cameras:
+            raise ValueError(
+                "ACT single_arm training requires AlohaMini cameras "
+                f"{sorted(required_cameras)}, missing {sorted(missing_cameras)}."
+            )
+        cfg.input_features.pop(left_wrist_camera, None)
+        cfg.action_feature_names = action_names
+        cfg._single_arm_state_indices = state_indices
+        cfg._single_arm_action_indices = action_indices
+
     # Store action feature names for relative_exclude_joints support
-    if ds_meta is not None and hasattr(cfg, "action_feature_names"):
+    if (
+        ds_meta is not None
+        and hasattr(cfg, "action_feature_names")
+        and not (isinstance(cfg, ACTConfig) and cfg.single_arm)
+    ):
         action_names = ds_meta.features.get(ACTION, {}).get("names")
         if action_names is not None:
             cfg.action_feature_names = list(action_names)
