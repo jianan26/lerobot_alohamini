@@ -17,7 +17,7 @@ from lerobot.configs.default import DatasetConfig
 
 
 def test_dataset_config_valid():
-    DatasetConfig(repo_id="user/repo", episodes=[0, 1, 2])
+    assert DatasetConfig(repo_id="user/repo", episodes=[0, 1, 2]).eval_seed == 42
 
 
 def test_dataset_config_negative_episodes():

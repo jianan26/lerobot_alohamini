@@ -15,6 +15,7 @@
 # limitations under the License.
 import logging
 import math
+import random
 from pprint import pformat
 
 import torch
@@ -144,7 +145,7 @@ def make_train_eval_datasets(
 ) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
-    The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.
+    A seeded random sample of ceil(n_episodes * eval_split) episodes per task is held out for evaluation.
     If eval_split == 0.0, returns (full_dataset, None).
     """
     full_dataset = make_dataset(cfg)
@@ -162,11 +163,14 @@ def make_train_eval_datasets(
         task_key = episode_tasks[ep_idx][0] if episode_tasks[ep_idx] else ""
         task_to_episodes.setdefault(task_key, []).append(ep_idx)
 
-    train_episodes, eval_episodes = [], []
+    rng = random.Random(cfg.dataset.eval_seed)
+    eval_episode_set = set()
     for eps in task_to_episodes.values():
         n_eval = math.ceil(len(eps) * cfg.dataset.eval_split)
-        train_episodes.extend(eps[: len(eps) - n_eval])
-        eval_episodes.extend(eps[len(eps) - n_eval :])
+        eval_episode_set.update(rng.sample(eps, n_eval))
+
+    train_episodes = [ep_idx for ep_idx in base_episodes if ep_idx not in eval_episode_set]
+    eval_episodes = [ep_idx for ep_idx in base_episodes if ep_idx in eval_episode_set]
 
     if not train_episodes:
         raise ValueError(
@@ -175,7 +179,8 @@ def make_train_eval_datasets(
 
     logging.info(
         f"Train/eval split: {len(train_episodes)} train, {len(eval_episodes)} eval "
-        f"(eval_split={cfg.dataset.eval_split}, {len(task_to_episodes)} tasks)"
+        f"(eval_split={cfg.dataset.eval_split}, eval_seed={cfg.dataset.eval_seed}, "
+        f"{len(task_to_episodes)} tasks, eval_episode_ids={eval_episodes})"
     )
 
     delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, full_dataset.meta)

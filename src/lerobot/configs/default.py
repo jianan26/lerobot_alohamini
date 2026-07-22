@@ -46,6 +46,8 @@ class DatasetConfig:
     streaming: bool = False
     # Fraction of episodes held out per task for offline evaluation (0.0 = disabled).
     eval_split: float = 0.0
+    # Seed used for the reproducible random selection of held-out evaluation episodes.
+    eval_seed: int = 42
 
     def __post_init__(self) -> None:
         if self.depth_output_unit not in (DEPTH_METER_UNIT, DEPTH_MILLIMETER_UNIT):
