@@ -22,6 +22,7 @@ from copy import copy
 
 import torch
 
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
@@ -112,8 +113,11 @@ class SyncInferenceEngine(InferenceEngine):
                 observation, self._device, self._task, self._robot_type
             )
             observation = self._preprocessor(observation)
-            action = self._policy.select_action(observation)
-            action = self._postprocessor(action)
+            if isinstance(self._policy, ACTPolicy) and self._policy.config.use_relative_actions:
+                action = self._policy.select_action_with_postprocessor(observation, self._postprocessor)
+            else:
+                action = self._policy.select_action(observation)
+                action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
 
         # Reorder to match dataset action ordering so the caller can treat

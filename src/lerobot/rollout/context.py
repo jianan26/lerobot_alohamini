@@ -34,6 +34,7 @@ from lerobot.datasets import (
     create_initial_features,
 )
 from lerobot.policies import get_policy_class, make_pre_post_processors
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
     PolicyProcessorPipeline,
@@ -399,9 +400,13 @@ def build_rollout_context(
         },
     )
 
-    if isinstance(cfg.inference, SyncInferenceConfig) and any(
-        isinstance(step, RelativeActionsProcessorStep) and step.enabled
-        for step in getattr(preprocessor, "steps", ())
+    if (
+        isinstance(cfg.inference, SyncInferenceConfig)
+        and not isinstance(policy, ACTPolicy)
+        and any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        )
     ):
         raise NotImplementedError(
             "SyncInferenceEngine does not support policies with relative actions for now."

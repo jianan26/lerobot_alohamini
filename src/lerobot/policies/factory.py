@@ -370,6 +370,16 @@ def make_pre_post_processors(
             from .act.processor_act import reconcile_act_data_augmentation_processor
 
             reconcile_act_data_augmentation_processor(policy_cfg, preprocessor)
+            relative_action_step = next(
+                (step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)), None
+            )
+            if relative_action_step is not None:
+                relative_action_step.enabled = policy_cfg.use_relative_actions
+                relative_action_step.exclude_joints = policy_cfg.relative_exclude_joints
+                relative_action_step.action_names = policy_cfg.action_feature_names
+            for step in postprocessor.steps:
+                if isinstance(step, AbsoluteActionsProcessorStep):
+                    step.enabled = policy_cfg.use_relative_actions
             relative_state_step = next(
                 (step for step in preprocessor.steps if isinstance(step, RelativeStateProcessorStep)), None
             )
@@ -387,6 +397,23 @@ def make_pre_post_processors(
                         action_names=policy_cfg.action_feature_names,
                     ),
                 )
+                relative_state_step = preprocessor.steps[batch_index]
+
+            if policy_cfg.use_relative_state and policy_cfg.use_relative_actions:
+                if relative_action_step is None or relative_state_step is None:
+                    raise ValueError("ACT relative preprocessing requires relative action and state steps.")
+                relative_action_step.state_window_index = 1
+                preprocessor.steps.remove(relative_action_step)
+                preprocessor.steps.remove(relative_state_step)
+                batch_index = next(
+                    index
+                    for index, step in enumerate(preprocessor.steps)
+                    if isinstance(step, AddBatchDimensionProcessorStep)
+                )
+                preprocessor.steps[batch_index + 1 : batch_index + 1] = [
+                    relative_action_step,
+                    relative_state_step,
+                ]
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

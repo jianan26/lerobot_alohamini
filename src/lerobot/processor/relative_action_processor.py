@@ -103,6 +103,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    state_window_index: int | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
 
     def _build_mask(self, action_dim: int) -> list[bool]:
@@ -127,6 +128,8 @@ class RelativeActionsProcessorStep(ProcessorStep):
     def __call__(self, transition: EnvTransition) -> EnvTransition:
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
+        if state is not None and self.state_window_index is not None:
+            state = state[..., self.state_window_index, :]
 
         # Always cache state for the paired AbsoluteActionsProcessorStep
         if state is not None:
@@ -153,6 +156,7 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "state_window_index": self.state_window_index,
         }
 
     def transform_features(

@@ -273,6 +273,7 @@ def make_act_pre_post_processors(
         enabled=config.use_relative_actions,
         exclude_joints=config.relative_exclude_joints,
         action_names=config.action_feature_names,
+        state_window_index=1 if config.use_relative_state and config.use_relative_actions else None,
     )
 
     normalization_stats = get_act_normalization_stats(config, dataset_stats)
@@ -295,21 +296,29 @@ def make_act_pre_post_processors(
                 excluded_observation_keys=["observation.images.wrist_left"],
             )
         )
-    if config.use_relative_state:
-        input_steps.append(
-            RelativeStateProcessorStep(
-                enabled=True,
-                exclude_joints=config.relative_exclude_joints,
-                action_names=config.action_feature_names,
-            )
+    if config.use_relative_state and config.use_relative_actions:
+        input_steps.extend(
+            [
+                AddBatchDimensionProcessorStep(),
+                relative_step,
+                RelativeStateProcessorStep(
+                    enabled=True,
+                    exclude_joints=config.relative_exclude_joints,
+                    action_names=config.action_feature_names,
+                ),
+            ]
         )
-    input_steps.extend(
-        [
-            AddBatchDimensionProcessorStep(),
-            relative_step,
-            DeviceProcessorStep(device=config.device),
-        ]
-    )
+    else:
+        if config.use_relative_state:
+            input_steps.append(
+                RelativeStateProcessorStep(
+                    enabled=True,
+                    exclude_joints=config.relative_exclude_joints,
+                    action_names=config.action_feature_names,
+                )
+            )
+        input_steps.extend([AddBatchDimensionProcessorStep(), relative_step])
+    input_steps.append(DeviceProcessorStep(device=config.device))
     if config.aug:
         input_steps.append(
             ACTDataAugmentationProcessorStep(

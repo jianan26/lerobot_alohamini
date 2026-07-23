@@ -26,6 +26,7 @@ import numpy as np
 import torch
 
 from lerobot.policies import PreTrainedPolicy, prepare_observation_for_inference
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.utils.import_utils import _deepdiff_available, require_package
 
 if TYPE_CHECKING or _deepdiff_available:
@@ -84,9 +85,11 @@ def predict_action(
 
         # Compute the next action with the policy
         # based on the current observation
-        action = policy.select_action(observation)
-
-        action = postprocessor(action)
+        if isinstance(policy, ACTPolicy) and policy.config.use_relative_actions:
+            action = policy.select_action_with_postprocessor(observation, postprocessor)
+        else:
+            action = policy.select_action(observation)
+            action = postprocessor(action)
 
     return action
 

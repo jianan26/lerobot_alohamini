@@ -16,6 +16,7 @@
 """Tests for ACT policy processor."""
 
 import tempfile
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -24,6 +25,7 @@ import torch
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.datasets.factory import resolve_delta_timestamps
 from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.policies.act.processor_act import SelectRightArmProcessorStep, make_act_pre_post_processors
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.processor import (
@@ -248,6 +250,59 @@ def test_act_relative_representations_use_relative_stats():
     torch.testing.assert_close(unnormalizer._tensor_stats[ACTION]["mean"], torch.full((4,), 3.0))
 
 
+def test_act_relative_state_and_actions_use_current_absolute_state_for_actions():
+    config = create_default_config()
+    config.use_relative_state = True
+    config.use_relative_actions = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_relative_stats())
+
+    relative_action_index = next(
+        index
+        for index, step in enumerate(preprocessor.steps)
+        if isinstance(step, RelativeActionsProcessorStep)
+    )
+    relative_state_index = next(
+        index for index, step in enumerate(preprocessor.steps) if isinstance(step, RelativeStateProcessorStep)
+    )
+    relative_action_step = preprocessor.steps[relative_action_index]
+    assert isinstance(relative_action_step, RelativeActionsProcessorStep)
+    assert relative_action_step.state_window_index == 1
+    assert relative_action_index < relative_state_index
+
+    state_window = torch.tensor([[[5.0, 7.0, 9.0, 11.0, 0.0, 0.0, 0.0], [2.0, 3.0, 4.0, 6.0, 0.0, 0.0, 0.0]]])
+    actions = torch.tensor([[[3.0, 5.0, 7.0, 9.0], [4.0, 6.0, 8.0, 10.0]]])
+    processed = preprocessor(transition_to_batch(create_transition({OBS_STATE: state_window}, actions)))
+
+    torch.testing.assert_close(processed[OBS_STATE], torch.tensor([[1.0, 1.5, 2.0, 2.5, -0.5, -0.5, -0.5]]))
+    torch.testing.assert_close(
+        processed[ACTION], torch.tensor([[[-0.5, -0.25, 0.0, 1.5], [-0.25, 0.0, 0.25, 1.75]]])
+    )
+    torch.testing.assert_close(postprocessor(processed[ACTION]), actions)
+
+
+def test_act_postprocesses_relative_chunks_before_queueing():
+    policy = ACTPolicy.__new__(ACTPolicy)
+    torch.nn.Module.__init__(policy)
+    policy.config = SimpleNamespace(temporal_ensemble_coeff=None, n_action_steps=2)
+    policy._postprocessed_action_queue = deque([], maxlen=2)
+    policy.predict_action_chunk = lambda _: torch.tensor([[[1.0], [2.0], [3.0]]])
+
+    postprocess_calls = []
+
+    def postprocess(actions):
+        postprocess_calls.append(actions.clone())
+        return actions + 10
+
+    first = policy.select_action_with_postprocessor({}, postprocess)
+    second = policy.select_action_with_postprocessor({}, postprocess)
+
+    torch.testing.assert_close(first, torch.tensor([[11.0]]))
+    torch.testing.assert_close(second, torch.tensor([[12.0]]))
+    assert len(postprocess_calls) == 1
+    torch.testing.assert_close(postprocess_calls[0], torch.tensor([[[1.0], [2.0], [3.0]]]))
+
+
 def test_act_relative_state_is_added_when_loading_an_older_processor(tmp_path):
     config = create_default_config()
     preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
@@ -262,6 +317,43 @@ def test_act_relative_state_is_added_when_loading_an_older_processor(tmp_path):
     assert any(isinstance(step, RelativeStateProcessorStep) for step in loaded_preprocessor.steps)
     normalizer = next(step for step in loaded_preprocessor.steps if isinstance(step, NormalizerProcessorStep))
     torch.testing.assert_close(normalizer._tensor_stats[OBS_STATE]["mean"], torch.ones(7))
+
+
+def test_act_relative_processors_are_reordered_when_loading_an_older_processor(tmp_path):
+    config = create_default_config()
+    preprocessor, postprocessor = make_act_pre_post_processors(config, create_default_stats())
+    preprocessor.save_pretrained(tmp_path)
+    postprocessor.save_pretrained(tmp_path)
+
+    config.use_relative_state = True
+    config.use_relative_actions = True
+    config.action_feature_names = ["joint_1", "joint_2", "joint_3", "gripper"]
+    loaded_preprocessor, loaded_postprocessor = make_pre_post_processors(
+        config, pretrained_path=tmp_path, dataset_stats=create_relative_stats()
+    )
+
+    relative_action_index = next(
+        index
+        for index, step in enumerate(loaded_preprocessor.steps)
+        if isinstance(step, RelativeActionsProcessorStep)
+    )
+    relative_state_index = next(
+        index
+        for index, step in enumerate(loaded_preprocessor.steps)
+        if isinstance(step, RelativeStateProcessorStep)
+    )
+    relative_action_step = loaded_preprocessor.steps[relative_action_index]
+    assert isinstance(relative_action_step, RelativeActionsProcessorStep)
+    assert relative_action_step.enabled
+    assert relative_action_step.state_window_index == 1
+    assert relative_action_index < relative_state_index
+
+    state_window = torch.tensor([[[5.0, 7.0, 9.0, 11.0, 0.0, 0.0, 0.0], [2.0, 3.0, 4.0, 6.0, 0.0, 0.0, 0.0]]])
+    actions = torch.tensor([[[3.0, 5.0, 7.0, 9.0]]])
+    processed = loaded_preprocessor(
+        transition_to_batch(create_transition({OBS_STATE: state_window}, actions))
+    )
+    torch.testing.assert_close(loaded_postprocessor(processed[ACTION]), actions)
 
 
 def test_act_relative_state_requests_only_a_state_window():

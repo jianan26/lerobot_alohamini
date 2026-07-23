@@ -83,6 +83,7 @@ from lerobot.envs import (
     preprocess_observation,
 )
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
+from lerobot.policies.act.modeling_act import ACTPolicy
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
 from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
@@ -279,10 +280,14 @@ def rollout(
 
             observation = preprocessor(observation)
             with torch.inference_mode():
-                action = policy.select_action(observation)
+                if isinstance(policy, ACTPolicy) and policy.config.use_relative_actions:
+                    action = policy.select_action_with_postprocessor(observation, postprocessor)
+                else:
+                    action = policy.select_action(observation)
             if predicted_latents_callback is not None:
                 predicted_latents_callback(policy)
-            action = postprocessor(action)
+            if not (isinstance(policy, ACTPolicy) and policy.config.use_relative_actions):
+                action = postprocessor(action)
 
             action_transition = {ACTION: action}
             action_transition = env_postprocessor(action_transition)

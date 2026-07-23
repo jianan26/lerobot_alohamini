@@ -96,6 +96,7 @@ class ACTPolicy(PreTrainedPolicy):
             self.temporal_ensembler.reset()
         else:
             self._action_queue = deque([], maxlen=self.config.n_action_steps)
+            self._postprocessed_action_queue = deque([], maxlen=self.config.n_action_steps)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -121,6 +122,26 @@ class ACTPolicy(PreTrainedPolicy):
             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._action_queue.extend(actions.transpose(0, 1))
         return self._action_queue.popleft()
+
+    @torch.no_grad()
+    def select_action_with_postprocessor(
+        self, batch: dict[str, Tensor], postprocessor: Callable[[Tensor], Tensor]
+    ) -> Tensor:
+        """Select an action after restoring a newly predicted relative-action chunk.
+
+        The postprocessor must run on the entire chunk at prediction time so every
+        queued action is restored with the state that anchored that chunk.
+        """
+        self.eval()
+
+        if self.config.temporal_ensemble_coeff is not None:
+            actions = postprocessor(self.predict_action_chunk(batch))
+            return self.temporal_ensembler.update(actions)
+
+        if len(self._postprocessed_action_queue) == 0:
+            actions = postprocessor(self.predict_action_chunk(batch))[:, : self.config.n_action_steps]
+            self._postprocessed_action_queue.extend(actions.transpose(0, 1))
+        return self._postprocessed_action_queue.popleft()
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
