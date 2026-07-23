@@ -157,7 +157,14 @@ def test_timed_data_deserialization_data_getters():
     # TimedObservation
     # ------------------------------------------------------------------
     obs_dict = {OBS_STATE: torch.arange(4).float()}
-    to_in = TimedObservation(timestamp=ts, observation=obs_dict, timestep=7, must_go=True)
+    previous_state = torch.arange(4).float() - 1
+    to_in = TimedObservation(
+        timestamp=ts,
+        observation=obs_dict,
+        timestep=7,
+        must_go=True,
+        previous_state=previous_state,
+    )
 
     to_bytes = pickle.dumps(to_in)  # nosec
     to_out: TimedObservation = pickle.loads(to_bytes)  # nosec B301
@@ -167,6 +174,7 @@ def test_timed_data_deserialization_data_getters():
     assert to_out.must_go is True
     assert to_out.get_observation().keys() == obs_dict.keys()
     torch.testing.assert_close(to_out.get_observation()[OBS_STATE], obs_dict[OBS_STATE])
+    torch.testing.assert_close(to_out.get_previous_state(), previous_state)
 
 
 # ---------------------------------------------------------------------

@@ -74,7 +74,9 @@ from .helpers import (
     RemotePolicyConfig,
     TimedAction,
     TimedObservation,
+    extract_state_from_raw_observation,
     get_logger,
+    make_lerobot_observation,
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
@@ -100,6 +102,7 @@ class RobotClient:
         self._active_action_dim: int | None = None
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
+        self.lerobot_features = lerobot_features
 
         # Use environment variable if server_address is not provided in config
         self.server_address = config.server_address
@@ -110,6 +113,8 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            use_relative_state=config.use_relative_state,
+            use_relative_actions=config.use_relative_actions,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -139,6 +144,7 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+        self._last_observation_state: torch.Tensor | None = None
 
     @property
     def running(self):
@@ -230,6 +236,7 @@ class RobotClient:
             self.stub.SendPolicyInstructions(policy_setup)
 
             self.shutdown_event.clear()
+            self._last_observation_state = None
 
             return True
 
@@ -484,13 +491,27 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def control_loop_observation(
+        self, task: str, verbose: bool = False, send: bool = True
+    ) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
             raw_observation: RawObservation = self.robot.get_observation()
             raw_observation["task"] = task
+
+            previous_state = None
+            if self.config.use_relative_state:
+                current_state = extract_state_from_raw_observation(
+                    make_lerobot_observation(raw_observation, self.lerobot_features)
+                )
+                previous_state = (
+                    self._last_observation_state
+                    if self._last_observation_state is not None
+                    else current_state
+                )
+                self._last_observation_state = current_state.detach().clone()
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -499,9 +520,13 @@ class RobotClient:
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
                 timestep=max(latest_action, 0),
+                previous_state=previous_state,
             )
 
             obs_capture_time = time.perf_counter() - start_time
+
+            if not send:
+                return raw_observation
 
             # If there are no actions left in the queue, the observation must go through processing!
             with self.action_queue_lock:
@@ -550,8 +575,9 @@ class RobotClient:
                 _performed_action = self.control_loop_action(verbose)
 
             """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+            ready_to_send = self._ready_to_send_observation()
+            if self.config.use_relative_state or ready_to_send:
+                _captured_observation = self.control_loop_observation(task, verbose, send=ready_to_send)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

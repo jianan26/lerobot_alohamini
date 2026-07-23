@@ -230,9 +230,13 @@ class TimedAction(TimedData):
 class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
+    previous_state: torch.Tensor | None = None
 
     def get_observation(self):
         return self.observation
+
+    def get_previous_state(self):
+        return self.previous_state
 
 
 @dataclass
@@ -271,6 +275,8 @@ class RemotePolicyConfig:
     actions_per_chunk: int
     device: str = "cpu"
     rename_map: dict[str, str] = field(default_factory=dict)
+    use_relative_state: bool = False
+    use_relative_actions: bool = False
 
 
 def _compare_observation_states(obs1_state: torch.Tensor, obs2_state: torch.Tensor, atol: float) -> bool:

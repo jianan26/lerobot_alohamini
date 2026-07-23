@@ -27,6 +27,12 @@ class AlohaMiniAsyncClientConfig:
     aggregate_fn_name: str = field(
         default="weighted_average", metadata={"help": "Overlapping action aggregation"}
     )
+    use_relative_state: bool = field(
+        default=False, metadata={"help": "Use ACT state[t-1] - state[t] inputs"}
+    )
+    use_relative_actions: bool = field(
+        default=False, metadata={"help": "Convert ACT relative predictions to absolute actions"}
+    )
 
     robot_model: str = field(default="alohamini2pro", metadata={"help": "Must match the Pi Host model"})
     robot_id: str = field(default="alohamini", metadata={"help": "Local robot identifier"})
@@ -66,6 +72,8 @@ class AlohaMiniAsyncClientConfig:
             chunk_size_threshold=self.chunk_size_threshold,
             fps=self.fps,
             aggregate_fn_name=self.aggregate_fn_name,
+            use_relative_state=self.use_relative_state,
+            use_relative_actions=self.use_relative_actions,
             action_key_sets={14: arm_action_keys, 18: full_action_keys},
         )
 

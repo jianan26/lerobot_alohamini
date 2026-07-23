@@ -22,7 +22,9 @@ import time
 import pytest
 import torch
 
-from lerobot.configs.types import PolicyFeature
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
+from lerobot.policies.act.configuration_act import ACTConfig
+from lerobot.policies.act.processor_act import make_act_pre_post_processors
 from lerobot.utils.constants import OBS_STATE
 from tests.utils import skip_if_package_missing
 
@@ -37,6 +39,12 @@ class MockPolicy:
 
     class _Config:
         robot_type = "dummy_robot"
+        input_features = {
+            OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,)),
+        }
+        output_features = {
+            "action": PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+        }
 
         @property
         def image_features(self) -> dict[str, PolicyFeature]:
@@ -217,3 +225,66 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+@pytest.mark.parametrize("use_relative_state", [False, True])
+@pytest.mark.parametrize("use_relative_actions", [False, True])
+def test_act_relative_inference_matches_training_processors(
+    monkeypatch, policy_server, use_relative_state: bool, use_relative_actions: bool
+):
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    action_dim = 6
+    config = ACTConfig(
+        use_relative_state=use_relative_state,
+        use_relative_actions=use_relative_actions,
+        relative_exclude_joints=[],
+    )
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(action_dim,)),
+    }
+    config.output_features = {
+        "action": PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
+    }
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.MEAN_STD,
+        FeatureType.ACTION: NormalizationMode.MEAN_STD,
+    }
+    config.device = "cpu"
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(action_dim), "std": torch.ones(action_dim)},
+        f"{OBS_STATE}_relative": {"mean": torch.zeros(action_dim), "std": torch.ones(action_dim)},
+        "action": {"mean": torch.zeros(action_dim), "std": torch.ones(action_dim)},
+        "action_relative": {"mean": torch.zeros(action_dim), "std": torch.ones(action_dim)},
+    }
+    policy_server.policy.config = config
+    policy_server.policy_type = "act"
+    policy_server.use_relative_state = use_relative_state
+    policy_server.use_relative_actions = use_relative_actions
+    policy_server.actions_per_chunk = 2
+    policy_server.preprocessor, policy_server.postprocessor = make_act_pre_post_processors(config, stats)
+
+    captured_observation = {}
+
+    def fake_get_action_chunk(_self, observation):
+        captured_observation.update(observation)
+        return torch.ones(1, 2, action_dim)
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", fake_get_action_chunk, raising=True)
+
+    current_state = torch.arange(action_dim, dtype=torch.float32) + 10
+    previous_state = current_state + 2
+    observation = _make_obs(current_state, timestep=5)
+    observation.previous_state = previous_state.unsqueeze(0)
+
+    timed_actions = policy_server._predict_action_chunk(observation)
+
+    expected_model_state = (
+        previous_state - current_state if use_relative_state else current_state
+    ).unsqueeze(0)
+    torch.testing.assert_close(captured_observation[OBS_STATE], expected_model_state)
+    expected_action = torch.ones(action_dim)
+    if use_relative_actions:
+        expected_action += current_state
+    for timed_action in timed_actions:
+        torch.testing.assert_close(timed_action.get_action(), expected_action)

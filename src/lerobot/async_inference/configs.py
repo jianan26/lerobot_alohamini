@@ -136,6 +136,12 @@ class RobotClientConfig:
     # Control behavior configuration
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    use_relative_state: bool = field(
+        default=False, metadata={"help": "Send consecutive states for ACT relative-state inference"}
+    )
+    use_relative_actions: bool = field(
+        default=False, metadata={"help": "Convert ACT relative action predictions back to absolute actions"}
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -212,6 +218,8 @@ class RobotClientConfig:
             "client_device": self.client_device,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
+            "use_relative_state": self.use_relative_state,
+            "use_relative_actions": self.use_relative_actions,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,

@@ -235,6 +235,32 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
     assert robot_client._ready_to_send_observation() is expected
 
 
+def test_relative_state_caches_unsent_control_cycle(robot_client, monkeypatch):
+    observations = iter(
+        [
+            {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+            {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0},
+        ]
+    )
+    sent_observations = []
+    robot_client.config.use_relative_state = True
+    monkeypatch.setattr(robot_client.robot, "get_observation", lambda: next(observations))
+    monkeypatch.setattr(
+        robot_client,
+        "send_observation",
+        lambda observation: sent_observations.append(observation) or True,
+    )
+
+    robot_client.control_loop_observation("task", send=False)
+    current_raw_observation = robot_client.control_loop_observation("task", send=True)
+
+    assert current_raw_observation["motor_1.pos"] == 4.0
+    assert len(sent_observations) == 1
+    torch.testing.assert_close(
+        sent_observations[0].get_previous_state(), torch.tensor([[1.0, 2.0, 3.0]])
+    )
+
+
 # -----------------------------------------------------------------------------
 # Regression test: robot type registry populated by robot_client imports
 # -----------------------------------------------------------------------------
@@ -335,6 +361,8 @@ def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
         policy_type="act",
         pretrained_name_or_path="checkpoint",
         actions_per_chunk=30,
+        use_relative_state=True,
+        use_relative_actions=True,
     )
 
     client_cfg = cfg.make_robot_client_config()
@@ -348,4 +376,6 @@ def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
         "theta.vel",
         "lift_axis.height_mm",
     ]
+    assert client_cfg.use_relative_state is True
+    assert client_cfg.use_relative_actions is True
     assert "127.0.0.1:18080" in " ".join(cfg.ssh_command())

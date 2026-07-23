@@ -84,6 +84,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
+        self.use_relative_state = False
+        self.use_relative_actions = False
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -145,11 +147,27 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = policy_specs.policy_type  # act, pi0, etc.
         self.lerobot_features = policy_specs.lerobot_features
         self.actions_per_chunk = policy_specs.actions_per_chunk
+        self.use_relative_state = getattr(policy_specs, "use_relative_state", False)
+        self.use_relative_actions = getattr(policy_specs, "use_relative_actions", False)
 
         policy_class = get_policy_class(self.policy_type)
 
         start = time.perf_counter()
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        if self.policy_type == "act":
+            checkpoint_relative_state = self.policy.config.use_relative_state
+            checkpoint_relative_actions = self.policy.config.use_relative_actions
+            if (
+                self.use_relative_state != checkpoint_relative_state
+                or self.use_relative_actions != checkpoint_relative_actions
+            ):
+                raise ValueError(
+                    "Client ACT relative settings must match the checkpoint training config: "
+                    f"client(use_relative_state={self.use_relative_state}, "
+                    f"use_relative_actions={self.use_relative_actions}), "
+                    f"checkpoint(use_relative_state={checkpoint_relative_state}, "
+                    f"use_relative_actions={checkpoint_relative_actions})."
+                )
         self.policy.to(self.device)
 
         # Load preprocessor and postprocessor, overriding device to match requested device
@@ -357,6 +375,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 f"using the first {expected_state_dim} configured dimensions."
             )
             observation["observation.state"] = state[..., :expected_state_dim]
+            state = observation["observation.state"]
+        if self.use_relative_state:
+            previous_state = observation_t.get_previous_state()
+            if previous_state is None:
+                raise ValueError("Relative-state inference requires state[t-1] from the client.")
+            previous_state = torch.as_tensor(previous_state, device=state.device, dtype=state.dtype)
+            if previous_state.shape[-1] < expected_state_dim:
+                raise ValueError(
+                    f"Robot provided {previous_state.shape[-1]} previous-state dimensions, "
+                    f"but the policy requires {expected_state_dim}."
+                )
+            previous_state = previous_state[..., :expected_state_dim]
+            if previous_state.shape != state.shape:
+                raise ValueError(
+                    f"Previous and current state shapes must match, got "
+                    f"{tuple(previous_state.shape)} and {tuple(state.shape)}."
+                )
+            observation["observation.state"] = torch.stack((previous_state, state), dim=-2)
         prepare_time = time.perf_counter() - start_prepare
 
         """2. Apply preprocessor"""

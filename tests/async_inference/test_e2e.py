@@ -54,11 +54,13 @@ def test_async_inference_e2e(monkeypatch):
     from lerobot.async_inference.helpers import map_robot_keys_to_lerobot_features
     from lerobot.async_inference.policy_server import PolicyServer
     from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.configs.types import FeatureType, PolicyFeature
     from lerobot.robots.utils import make_robot_from_config
     from lerobot.transport import (
         services_pb2,  # type: ignore
         services_pb2_grpc,  # type: ignore
     )
+    from lerobot.utils.constants import OBS_STATE
     from tests.mocks.mock_robot import MockRobotConfig
 
     # Create a stub policy similar to test_policy_server.py
@@ -67,6 +69,12 @@ def test_async_inference_e2e(monkeypatch):
 
         class _Config:
             robot_type = "dummy_robot"
+            input_features = {
+                OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+            }
+            output_features = {
+                "action": PolicyFeature(type=FeatureType.ACTION, shape=(6,)),
+            }
 
             @property
             def image_features(self):
