@@ -63,6 +63,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.async_inference_diagnostics import DiagnosticRecorder
 from lerobot.utils.import_utils import register_third_party_plugins
 
 from .configs import RobotClientConfig
@@ -145,10 +146,28 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
         self._last_observation_state: torch.Tensor | None = None
+        self._observation_request_id = 0
+        self.diagnostics = DiagnosticRecorder(
+            "robot_client",
+            enabled=config.diagnostics,
+            root_dir=config.diagnostics_dir,
+            session_id=config.diagnostics_session_id,
+            manifest={
+                "config": asdict(config),
+                "action_keys": self._action_key_sets
+                or {len(self._default_action_keys): self._default_action_keys},
+                "state_features": lerobot_features,
+            },
+        )
 
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    def _record_diagnostic(self, event: str, **payload: Any) -> None:
+        diagnostics = getattr(self, "diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.record_event(event, **payload)
 
     def _resolve_action_key_sets(
         self, configured_key_sets: dict[int, list[str]] | None
@@ -253,6 +272,7 @@ class RobotClient:
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
+        self.diagnostics.close()
 
     def send_observation(
         self,
@@ -278,9 +298,20 @@ class RobotClient:
                 log_prefix="[CLIENT] Observation",
                 silent=True,
             )
+            rpc_start = time.perf_counter()
             _ = self.stub.SendObservations(observation_iterator)
+            rpc_time = time.perf_counter() - rpc_start
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
+            self._record_diagnostic(
+                "observation_sent",
+                request_id=obs.request_id,
+                timestep=obs_timestep,
+                must_go=obs.must_go,
+                observation_timestamp=obs.get_timestamp(),
+                serialization_ms=serialize_time * 1000,
+                rpc_ms=rpc_time * 1000,
+            )
 
             return True
 
@@ -311,6 +342,9 @@ class RobotClient:
             internal_queue = self.action_queue.queue
 
         current_action_queue = {action.get_timestep(): action.get_action() for action in internal_queue}
+        current_action_sources = {
+            action.get_timestep(): action.source_request_ids for action in internal_queue
+        }
 
         for new_action in incoming_actions:
             with self.latest_action_lock:
@@ -333,6 +367,14 @@ class RobotClient:
                     timestep=new_action.get_timestep(),
                     action=aggregate_fn(
                         current_action_queue[new_action.get_timestep()], new_action.get_action()
+                    ),
+                    source_request_ids=tuple(
+                        dict.fromkeys(
+                            (
+                                *current_action_sources[new_action.get_timestep()],
+                                *new_action.source_request_ids,
+                            )
+                        )
                     ),
                 )
             )
@@ -362,6 +404,21 @@ class RobotClient:
 
                 if not self._accept_action_chunk(timed_actions):
                     break
+
+                if self.diagnostics.enabled:
+                    self._record_diagnostic(
+                        "action_chunk_received",
+                        source_request_ids=sorted(
+                            {
+                                request_id
+                                for action in timed_actions
+                                for request_id in action.source_request_ids
+                            }
+                        ),
+                        timesteps=[action.get_timestep() for action in timed_actions],
+                        actions=[action.get_action() for action in timed_actions],
+                        deserialize_ms=deserialize_time * 1000,
+                    )
 
                 # Log device type of received actions
                 if len(timed_actions) > 0:
@@ -410,6 +467,23 @@ class RobotClient:
                 start_time = time.perf_counter()
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
+                if self.diagnostics.enabled:
+                    with self.action_queue_lock:
+                        resulting_actions = list(self.action_queue.queue)
+                    self._record_diagnostic(
+                        "action_queue_updated",
+                        aggregate_fn=self.config.aggregate_fn_name,
+                        queue_update_ms=queue_update_time * 1000,
+                        queue_size=len(resulting_actions),
+                        queue=[
+                            {
+                                "timestep": action.get_timestep(),
+                                "source_request_ids": action.source_request_ids,
+                                "action": action.get_action(),
+                            }
+                            for action in resulting_actions
+                        ],
+                    )
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
@@ -464,11 +538,27 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        send_start = time.perf_counter()
+        _performed_action = self.robot.send_action(action_dict)
+        send_time = time.perf_counter() - send_start
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+
+        with self.action_queue_lock:
+            remaining_queue_size = self.action_queue.qsize()
+        self._record_diagnostic(
+            "action_dispatched",
+            timestep=timed_action.get_timestep(),
+            source_request_ids=timed_action.source_request_ids,
+            server_action_timestamp=timed_action.get_timestamp(),
+            requested_action=action_dict,
+            robot_returned_action=_performed_action,
+            send_action_ms=send_time * 1000,
+            queue_pop_ms=get_end * 1000,
+            remaining_queue_size=remaining_queue_size,
+            robot_timings=getattr(self.robot, "logs", {}),
+        )
 
         if verbose:
             with self.action_queue_lock:
@@ -491,9 +581,7 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(
-        self, task: str, verbose: bool = False, send: bool = True
-    ) -> RawObservation:
+    def control_loop_observation(self, task: str, verbose: bool = False, send: bool = True) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
@@ -528,12 +616,24 @@ class RobotClient:
             if not send:
                 return raw_observation
 
+            self._observation_request_id += 1
+            observation.request_id = self._observation_request_id
+
             # If there are no actions left in the queue, the observation must go through processing!
             with self.action_queue_lock:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
 
             _ = self.send_observation(observation)
+            self._record_diagnostic(
+                "observation_captured",
+                request_id=observation.request_id,
+                timestep=observation.get_timestep(),
+                capture_ms=obs_capture_time * 1000,
+                queue_size=current_queue_size,
+                must_go=observation.must_go,
+                robot_timings=getattr(self.robot, "logs", {}),
+            )
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
@@ -570,16 +670,26 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+            action_executed = False
+            observation_captured = False
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
+                action_executed = True
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             ready_to_send = self._ready_to_send_observation()
             if self.config.use_relative_state or ready_to_send:
                 _captured_observation = self.control_loop_observation(task, verbose, send=ready_to_send)
+                observation_captured = True
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
+            self._record_diagnostic(
+                "control_loop",
+                duration_ms=(time.perf_counter() - control_loop_start) * 1000,
+                action_executed=action_executed,
+                observation_captured=observation_captured,
+            )
             # Dynamically adjust sleep time to maintain the desired control frequency
             time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 

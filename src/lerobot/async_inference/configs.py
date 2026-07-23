@@ -14,6 +14,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import torch
 
@@ -64,6 +65,18 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    diagnostics: bool = field(default=False, metadata={"help": "Enable diagnostic recording"})
+    diagnostics_dir: Path = field(
+        default=Path("logs/async_diagnostics"),
+        metadata={"help": "Diagnostic path relative to repository root"},
+    )
+    diagnostics_session_id: str | None = field(
+        default=None, metadata={"help": "Shared diagnostic session identifier"}
+    )
+    diagnostics_sample_interval: int = field(
+        default=10, metadata={"help": "Save one full observation for every N received requests"}
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -77,6 +90,11 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.diagnostics_sample_interval <= 0:
+            raise ValueError(
+                f"diagnostics_sample_interval must be positive, got {self.diagnostics_sample_interval}"
+            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -96,6 +114,10 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "diagnostics": self.diagnostics,
+            "diagnostics_dir": str(self.diagnostics_dir),
+            "diagnostics_session_id": self.diagnostics_session_id,
+            "diagnostics_sample_interval": self.diagnostics_sample_interval,
         }
 
 
@@ -152,6 +174,14 @@ class RobotClientConfig:
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
+    )
+    diagnostics: bool = field(default=False, metadata={"help": "Enable diagnostic recording"})
+    diagnostics_dir: Path = field(
+        default=Path("logs/async_diagnostics"),
+        metadata={"help": "Diagnostic path relative to repository root"},
+    )
+    diagnostics_session_id: str | None = field(
+        default=None, metadata={"help": "Shared diagnostic session identifier"}
     )
 
     # Optional action schemas keyed by action-vector dimension. This is useful for
@@ -223,6 +253,9 @@ class RobotClientConfig:
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
+            "diagnostics": self.diagnostics,
+            "diagnostics_dir": str(self.diagnostics_dir),
+            "diagnostics_session_id": self.diagnostics_session_id,
             "aggregate_fn_name": self.aggregate_fn_name,
             "action_key_sets": self.action_key_sets,
         }

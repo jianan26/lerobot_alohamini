@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.cameras.configs import CameraConfig, Cv2Rotation
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
@@ -68,8 +69,6 @@ class AlohaMiniConfig(RobotConfig):
     no_follower: bool = False
 
 
-
-
 @dataclass
 class AlohaMiniHostConfig:
     # Network Configuration
@@ -86,7 +85,9 @@ class AlohaMiniHostConfig:
     # If robot jitters decrease the frequency and monitor cpu load with `top` in cmd
     max_loop_freq_hz: int = 30
 
-
+    diagnostics: bool = False
+    diagnostics_dir: Path = Path("logs/async_diagnostics")
+    diagnostics_session_id: str | None = None
 
 
 @RobotConfig.register_subclass("alohamini_client")

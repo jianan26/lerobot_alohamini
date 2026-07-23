@@ -36,6 +36,7 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.policies import get_policy_class, make_pre_post_processors
@@ -46,6 +47,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import receive_bytes_in_chunks
 from lerobot.types import PolicyAction
+from lerobot.utils.async_inference_diagnostics import DiagnosticRecorder, should_sample
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -78,6 +80,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self._predicted_timesteps = set()
 
         self.last_processed_obs = None
+        self._received_request_count = 0
+        self.diagnostics = DiagnosticRecorder(
+            "policy_server",
+            enabled=config.diagnostics,
+            root_dir=config.diagnostics_dir,
+            session_id=config.diagnostics_session_id,
+            manifest={"config": asdict(config)},
+        )
 
         # Attributes will be set by SendPolicyInstructions
         self.device = None
@@ -103,6 +113,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         # only running inference on the latest observation received by the server
         self.shutdown_event.set()
         self.observation_queue = Queue(maxsize=1)
+        self._received_request_count = 0
 
         with self._predicted_timesteps_lock:
             self._predicted_timesteps = set()
@@ -185,6 +196,18 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         end = time.perf_counter()
 
         self.logger.info(f"Time taken to put policy on {self.device}: {end - start:.4f} seconds")
+        self.diagnostics.record_event(
+            "policy_loaded",
+            policy_type=self.policy_type,
+            pretrained_name_or_path=policy_specs.pretrained_name_or_path,
+            device=self.device,
+            actions_per_chunk=self.actions_per_chunk,
+            use_relative_state=self.use_relative_state,
+            use_relative_actions=self.use_relative_actions,
+            input_features=self.policy.config.input_features,
+            output_features=self.policy.config.output_features,
+            load_ms=(end - start) * 1000,
+        )
 
         return services_pb2.Empty()
 
@@ -200,6 +223,34 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )  # blocking call while looping over request_iterator
         timed_observation = pickle.loads(received_bytes)  # nosec
         deserialize_time = time.perf_counter() - start_deserialize
+
+        self._received_request_count += 1
+        request_id = timed_observation.request_id
+        if request_id is None:
+            request_id = self._received_request_count
+            timed_observation.request_id = request_id
+
+        sample_payload = None
+        if self.diagnostics.enabled and should_sample(
+            self._received_request_count, self.config.diagnostics_sample_interval
+        ):
+            raw_observation = timed_observation.get_observation()
+            images = {
+                key: value
+                for key, value in raw_observation.items()
+                if isinstance(value, np.ndarray) and value.ndim == 3
+            }
+            state = {
+                "request_id": request_id,
+                "request_index": self._received_request_count,
+                "timestep": timed_observation.get_timestep(),
+                "client_timestamp": timed_observation.get_timestamp(),
+                "must_go": timed_observation.must_go,
+                "previous_state": timed_observation.get_previous_state(),
+                "observation": {key: value for key, value in raw_observation.items() if key not in images},
+                "image_shapes": {key: list(value.shape) for key, value in images.items()},
+            }
+            sample_payload = (state, images)
 
         self.logger.debug(f"Received observation #{timed_observation.get_timestep()}")
 
@@ -222,9 +273,25 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Deserialization time: {deserialize_time:.6f}s"
         )
 
-        if not self._enqueue_observation(
+        enqueued = self._enqueue_observation(
             timed_observation  # wrapping a RawObservation
-        ):
+        )
+        self.diagnostics.record_event(
+            "observation_received",
+            request_id=request_id,
+            request_index=self._received_request_count,
+            timestep=obs_timestep,
+            must_go=timed_observation.must_go,
+            enqueued=enqueued,
+            deserialize_ms=deserialize_time * 1000,
+            server_receive_time=receive_time,
+            client_timestamp=obs_timestamp,
+        )
+        if sample_payload is not None:
+            state, images = sample_payload
+            state["enqueued"] = enqueued
+            self.diagnostics.record_observation_sample(request_id, state=state, images=images)
+        if not enqueued:
             self.logger.debug(f"Observation #{obs_timestep} has been filtered out")
 
         return services_pb2.Empty()
@@ -327,13 +394,24 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         return False
 
-    def _time_action_chunk(self, t_0: float, action_chunk: list[torch.Tensor], i_0: int) -> list[TimedAction]:
+    def _time_action_chunk(
+        self,
+        t_0: float,
+        action_chunk: list[torch.Tensor],
+        i_0: int,
+        request_id: int | None = None,
+    ) -> list[TimedAction]:
         """Turn a chunk of actions into a list of TimedAction instances,
         with the first action corresponding to t_0 and the rest corresponding to
         t_0 + i*environment_dt for i in range(len(action_chunk))
         """
         return [
-            TimedAction(timestamp=t_0 + i * self.config.environment_dt, timestep=i_0 + i, action=action)
+            TimedAction(
+                timestamp=t_0 + i * self.config.environment_dt,
+                timestep=i_0 + i,
+                action=action,
+                source_request_ids=() if request_id is None else (request_id,),
+            )
             for i, action in enumerate(action_chunk)
         ]
 
@@ -400,12 +478,14 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
         observation = self.preprocessor(observation)
+        preprocessed_state = observation.get("observation.state")
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
         """3. Get action chunk"""
         start_inference = time.perf_counter()
         action_tensor = self._get_action_chunk(observation)
+        model_action_tensor = action_tensor.detach().clone() if self.diagnostics.enabled else None
         expected_action_dim = self.policy.config.output_features["action"].shape[0]
         if action_tensor.shape[-1] < expected_action_dim:
             raise ValueError(
@@ -446,7 +526,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(
-            observation_t.get_timestamp(), list(action_tensor), observation_t.get_timestep()
+            observation_t.get_timestamp(),
+            list(action_tensor),
+            observation_t.get_timestep(),
+            observation_t.request_id,
         )
         postprocess_stops = time.perf_counter()
         postprocessing_time = postprocess_stops - start_postprocess
@@ -465,11 +548,26 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             f"Total time: {1000 * (postprocess_stops - start_prepare):.2f}ms"
         )
 
+        self.diagnostics.record_event(
+            "inference_completed",
+            request_id=observation_t.request_id,
+            timestep=observation_t.get_timestep(),
+            prepared_state=state,
+            preprocessed_state=preprocessed_state,
+            model_action_before_postprocess=model_action_tensor,
+            action_after_postprocess=action_tensor,
+            prepare_ms=prepare_time * 1000,
+            preprocess_ms=preprocessing_time * 1000,
+            inference_ms=inference_time * 1000,
+            postprocess_ms=postprocessing_time * 1000,
+        )
+
         return action_chunk
 
     def stop(self):
         """Stop the server"""
         self._reset_server()
+        self.diagnostics.close()
         self.logger.info("Server stopping...")
 
 
@@ -492,10 +590,11 @@ def serve(cfg: PolicyServerConfig):
 
     policy_server.logger.info(f"PolicyServer started on {cfg.host}:{cfg.port}")
     server.start()
-
-    server.wait_for_termination()
-
-    policy_server.logger.info("Server terminated")
+    try:
+        server.wait_for_termination()
+    finally:
+        policy_server.stop()
+        policy_server.logger.info("Server terminated")
 
 
 if __name__ == "__main__":

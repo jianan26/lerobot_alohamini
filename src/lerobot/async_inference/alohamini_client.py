@@ -5,6 +5,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import draccus
 
@@ -27,11 +28,17 @@ class AlohaMiniAsyncClientConfig:
     aggregate_fn_name: str = field(
         default="weighted_average", metadata={"help": "Overlapping action aggregation"}
     )
-    use_relative_state: bool = field(
-        default=False, metadata={"help": "Use ACT state[t-1] - state[t] inputs"}
-    )
+    use_relative_state: bool = field(default=False, metadata={"help": "Use ACT state[t-1] - state[t] inputs"})
     use_relative_actions: bool = field(
         default=False, metadata={"help": "Convert ACT relative predictions to absolute actions"}
+    )
+    diagnostics: bool = field(default=False, metadata={"help": "Enable diagnostic recording"})
+    diagnostics_dir: Path = field(
+        default=Path("logs/async_diagnostics"),
+        metadata={"help": "Diagnostic path relative to repository root"},
+    )
+    diagnostics_session_id: str | None = field(
+        default=None, metadata={"help": "Shared diagnostic session identifier"}
     )
 
     robot_model: str = field(default="alohamini2pro", metadata={"help": "Must match the Pi Host model"})
@@ -74,6 +81,9 @@ class AlohaMiniAsyncClientConfig:
             aggregate_fn_name=self.aggregate_fn_name,
             use_relative_state=self.use_relative_state,
             use_relative_actions=self.use_relative_actions,
+            diagnostics=self.diagnostics,
+            diagnostics_dir=self.diagnostics_dir,
+            diagnostics_session_id=self.diagnostics_session_id,
             action_key_sets={
                 len(right_arm_keys): list(right_arm_keys),
                 len(arm_action_keys): arm_action_keys,

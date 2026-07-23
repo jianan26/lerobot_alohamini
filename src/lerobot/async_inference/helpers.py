@@ -210,6 +210,7 @@ class TimedData:
 @dataclass
 class TimedAction(TimedData):
     action: Action
+    source_request_ids: tuple[int, ...] = ()
 
     def get_action(self):
         return self.action
@@ -220,6 +221,7 @@ class TimedObservation(TimedData):
     observation: RawObservation
     must_go: bool = False
     previous_state: torch.Tensor | None = None
+    request_id: int | None = None
 
     def get_observation(self):
         return self.observation

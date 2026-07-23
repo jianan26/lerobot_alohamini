@@ -18,9 +18,13 @@ import argparse
 import json
 import logging
 import time
+from dataclasses import asdict
+from pathlib import Path
 
 import cv2
 import zmq
+
+from lerobot.utils.async_inference_diagnostics import DiagnosticRecorder
 
 from .alohamini import AlohaMini
 from .config_alohamini import AlohaMiniConfig, AlohaMiniHostConfig
@@ -49,7 +53,7 @@ class AlohaMiniHost:
         self.zmq_observation_socket.close()
         self.zmq_cmd_socket.close()
         self.zmq_context.term()
- 
+
 
 def _jsonable(value):
     """Convert numpy scalars to JSON-native values without touching normal Python values."""
@@ -129,9 +133,20 @@ def main():
         const=True,
         default=False,
         help=(
-            "Print average Host, motor, camera, JPEG, and network timings once per second "
-            "(default: false)."
+            "Print average Host, motor, camera, JPEG, and network timings once per second (default: false)."
         ),
+    )
+    parser.add_argument("--diagnostics", action="store_true", help="Enable diagnostic recording.")
+    parser.add_argument(
+        "--diagnostics-dir",
+        type=Path,
+        default=Path("logs/async_diagnostics"),
+        help="Diagnostic path relative to the lerobot_alohamini repository root.",
+    )
+    parser.add_argument(
+        "--diagnostics-session-id",
+        default=None,
+        help="Session identifier shared with the inference server and robot client.",
     )
     args = parser.parse_args()
 
@@ -144,13 +159,27 @@ def main():
         logging.info("no_follower mode: follower arms will not connect, only base and lift operate.")
     robot = AlohaMini(robot_config)
 
-
     logging.info("Connecting AlohaMini")
     robot.connect()
 
     logging.info("Starting HostAgent")
     host_config = AlohaMiniHostConfig()
+    host_config.diagnostics = args.diagnostics
+    host_config.diagnostics_dir = args.diagnostics_dir
+    host_config.diagnostics_session_id = args.diagnostics_session_id
     host = AlohaMiniHost(host_config)
+    diagnostics = DiagnosticRecorder(
+        "alohamini_host",
+        enabled=host_config.diagnostics,
+        root_dir=host_config.diagnostics_dir,
+        session_id=host_config.diagnostics_session_id,
+        manifest={
+            "host_config": asdict(host_config),
+            "robot_model": args.robot_model,
+            "state_keys": list(robot._state_ft),
+            "action_keys": list(robot.action_features),
+        },
+    )
 
     last_cmd_time = time.time()
     watchdog_active = False
@@ -169,13 +198,17 @@ def main():
         while duration < host.connection_time_s:
             loop_start_t = time.perf_counter()
             command_received = False
+            requested_action = None
+            action_sent = None
+            watchdog_triggered = False
             try:
                 msg = host.zmq_cmd_socket.recv_string(zmq.NOBLOCK)
                 data = dict(json.loads(msg))
-                #print(f"Received action: {data}")   # debug 
-                _action_sent = robot.send_action(data)
+                requested_action = data
+                # print(f"Received action: {data}")   # debug
+                action_sent = robot.send_action(data)
                 command_received = True
-                
+
                 last_cmd_time = time.time()
                 watchdog_active = False
             except zmq.Again:
@@ -190,9 +223,9 @@ def main():
                     f"Command not received for more than {host.watchdog_timeout_ms} milliseconds. Stopping robot motion."
                 )
                 watchdog_active = True
+                watchdog_triggered = True
                 robot.stop_motion()
 
-            
             last_observation = robot.get_observation()
             observation_done_t = time.perf_counter()
 
@@ -237,6 +270,26 @@ def main():
                 "loop": (loop_done_t - loop_start_t) * 1e3,
                 **robot.logs.get("observation_timing_ms", {}),
             }
+            state_observation = None
+            if diagnostics.enabled and (command_received or watchdog_triggered):
+                state_observation = {
+                    key: value for key, value in last_observation.items() if key not in robot.cameras
+                }
+            if diagnostics.enabled and command_received:
+                diagnostics.record_event(
+                    "command_executed",
+                    requested_action=requested_action,
+                    action_after_protection=action_sent,
+                    following_state=state_observation,
+                    action_timings=robot.logs.get("action_timing_ms", {}),
+                    loop_timings=loop_timings_ms,
+                )
+            if diagnostics.enabled and watchdog_triggered:
+                diagnostics.record_event(
+                    "watchdog_triggered",
+                    following_state=state_observation,
+                    timeout_ms=host.watchdog_timeout_ms,
+                )
             for name, value_ms in loop_timings_ms.items():
                 timing_totals_ms[name] = timing_totals_ms.get(name, 0.0) + value_ms
             timing_loop_count += 1
@@ -247,13 +300,9 @@ def main():
 
             timing_elapsed_s = loop_done_t - timing_report_start_t
             if args.profile_timing and timing_elapsed_s >= 1.0:
-                averages = {
-                    name: total_ms / timing_loop_count for name, total_ms in timing_totals_ms.items()
-                }
+                averages = {name: total_ms / timing_loop_count for name, total_ms in timing_totals_ms.items()}
                 camera_text = " ".join(
-                    f"{name}={value:.1f}"
-                    for name, value in averages.items()
-                    if name.startswith("camera_")
+                    f"{name}={value:.1f}" for name, value in averages.items() if name.startswith("camera_")
                 )
                 print(
                     f"[HOST TIMING avg ms/loop] Hz={timing_loop_count / timing_elapsed_s:.1f} "
@@ -298,9 +347,12 @@ def main():
         print("Keyboard interrupt received. Exiting...")
     finally:
         print("Shutting down AlohaMini Host.")
+        diagnostics.close()
         robot.disconnect()
         host.disconnect()
 
     logging.info("Finished AlohaMini cleanly")
+
+
 if __name__ == "__main__":
     main()

@@ -348,3 +348,15 @@ def test_act_relative_inference_matches_training_processors(
         expected_action += current_state
     for timed_action in timed_actions:
         torch.testing.assert_close(timed_action.get_action(), expected_action)
+
+
+def test_time_action_chunk_keeps_source_request_id(policy_server):
+    actions = policy_server._time_action_chunk(
+        100.0,
+        [torch.zeros(6), torch.ones(6)],
+        7,
+        request_id=42,
+    )
+
+    assert [action.get_timestep() for action in actions] == [7, 8]
+    assert [action.source_request_ids for action in actions] == [(42,), (42,)]

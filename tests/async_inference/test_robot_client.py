@@ -174,6 +174,30 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
 
 
+def test_aggregate_action_queues_preserves_source_request_ids(robot_client):
+    from lerobot.async_inference.helpers import TimedAction
+
+    old_action = TimedAction(
+        timestamp=0,
+        timestep=5,
+        action=torch.zeros(6),
+        source_request_ids=(10,),
+    )
+    new_action = TimedAction(
+        timestamp=1,
+        timestep=5,
+        action=torch.ones(6),
+        source_request_ids=(11,),
+    )
+    robot_client.action_queue.put(old_action)
+
+    robot_client._aggregate_action_queues([new_action], lambda old, new: (old + new) / 2)
+
+    aggregated = robot_client.action_queue.get_nowait()
+    assert aggregated.source_request_ids == (10, 11)
+    torch.testing.assert_close(aggregated.get_action(), torch.full((6,), 0.5))
+
+
 @pytest.mark.parametrize(
     "chunk_size, queue_len, expected",
     [
@@ -256,9 +280,7 @@ def test_relative_state_caches_unsent_control_cycle(robot_client, monkeypatch):
 
     assert current_raw_observation["motor_1.pos"] == 4.0
     assert len(sent_observations) == 1
-    torch.testing.assert_close(
-        sent_observations[0].get_previous_state(), torch.tensor([[1.0, 2.0, 3.0]])
-    )
+    torch.testing.assert_close(sent_observations[0].get_previous_state(), torch.tensor([[1.0, 2.0, 3.0]]))
 
 
 # -----------------------------------------------------------------------------
@@ -364,6 +386,8 @@ def test_alohamini_async_config_builds_single_and_bimanual_action_key_sets():
         actions_per_chunk=30,
         use_relative_state=True,
         use_relative_actions=True,
+        diagnostics=True,
+        diagnostics_session_id="slow_motion_001",
     )
 
     client_cfg = cfg.make_robot_client_config()
@@ -381,6 +405,8 @@ def test_alohamini_async_config_builds_single_and_bimanual_action_key_sets():
     ]
     assert client_cfg.use_relative_state is True
     assert client_cfg.use_relative_actions is True
+    assert client_cfg.diagnostics is True
+    assert client_cfg.diagnostics_session_id == "slow_motion_001"
     assert "127.0.0.1:18080" in " ".join(cfg.ssh_command())
 
     client = _action_validation_client(
