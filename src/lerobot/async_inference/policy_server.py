@@ -364,12 +364,13 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         expected_state_dim = self.policy.config.input_features["observation.state"].shape[0]
         state = observation["observation.state"]
+        single_arm = self.policy_type == "act" and getattr(self.policy.config, "single_arm", False)
         if state.shape[-1] < expected_state_dim:
             raise ValueError(
                 f"Robot provided {state.shape[-1]} state dimensions, "
                 f"but the policy requires {expected_state_dim}."
             )
-        if state.shape[-1] > expected_state_dim:
+        if state.shape[-1] > expected_state_dim and not single_arm:
             self.logger.info(
                 f"Robot provided {state.shape[-1]} state dimensions; "
                 f"using the first {expected_state_dim} configured dimensions."
@@ -386,7 +387,8 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                     f"Robot provided {previous_state.shape[-1]} previous-state dimensions, "
                     f"but the policy requires {expected_state_dim}."
                 )
-            previous_state = previous_state[..., :expected_state_dim]
+            if not single_arm:
+                previous_state = previous_state[..., :expected_state_dim]
             if previous_state.shape != state.shape:
                 raise ValueError(
                     f"Previous and current state shapes must match, got "

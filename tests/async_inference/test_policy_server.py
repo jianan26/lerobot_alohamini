@@ -228,6 +228,66 @@ def test_predict_action_chunk(monkeypatch, policy_server):
 
 
 @pytest.mark.parametrize("use_relative_state", [False, True])
+def test_act_single_arm_inference_selects_right_arm_state(
+    monkeypatch, policy_server, use_relative_state: bool
+):
+    from lerobot.async_inference.helpers import TimedObservation
+    from lerobot.async_inference.policy_server import PolicyServer
+
+    raw_state_dim = 18
+    action_dim = 7
+    config = ACTConfig(single_arm=True, use_relative_state=use_relative_state, device="cpu")
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(action_dim,)),
+    }
+    config.output_features = {
+        "action": PolicyFeature(type=FeatureType.ACTION, shape=(action_dim,)),
+    }
+    config._single_arm_state_indices = list(range(7, 14))
+    config._single_arm_action_indices = list(range(7, 14))
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(raw_state_dim), "std": torch.ones(raw_state_dim)},
+        f"{OBS_STATE}_relative": {
+            "mean": torch.zeros(raw_state_dim),
+            "std": torch.ones(raw_state_dim),
+        },
+        "action": {"mean": torch.zeros(raw_state_dim), "std": torch.ones(raw_state_dim)},
+    }
+    policy_server.policy.config = config
+    policy_server.policy_type = "act"
+    policy_server.use_relative_state = use_relative_state
+    policy_server.use_relative_actions = False
+    policy_server.actions_per_chunk = 2
+    policy_server.preprocessor, policy_server.postprocessor = make_act_pre_post_processors(config, stats)
+
+    state_names = [f"joint{index}" for index in range(raw_state_dim)]
+    policy_server.lerobot_features = {
+        OBS_STATE: {"dtype": "float32", "shape": [raw_state_dim], "names": state_names}
+    }
+    captured_observation = {}
+
+    def fake_get_action_chunk(_self, observation):
+        captured_observation.update(observation)
+        return torch.zeros(1, 2, action_dim)
+
+    monkeypatch.setattr(PolicyServer, "_get_action_chunk", fake_get_action_chunk, raising=True)
+
+    current_state = torch.arange(raw_state_dim, dtype=torch.float32) + 10
+    previous_state = current_state + 2
+    observation = TimedObservation(
+        observation={key: current_state[index].item() for index, key in enumerate(state_names)},
+        timestamp=time.time(),
+        timestep=5,
+        previous_state=previous_state.unsqueeze(0) if use_relative_state else None,
+    )
+
+    policy_server._predict_action_chunk(observation)
+
+    expected_state = previous_state[7:14] - current_state[7:14] if use_relative_state else current_state[7:14]
+    torch.testing.assert_close(captured_observation[OBS_STATE], expected_state.unsqueeze(0))
+
+
+@pytest.mark.parametrize("use_relative_state", [False, True])
 @pytest.mark.parametrize("use_relative_actions", [False, True])
 def test_act_relative_inference_matches_training_processors(
     monkeypatch, policy_server, use_relative_state: bool, use_relative_actions: bool

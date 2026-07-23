@@ -340,6 +340,18 @@ def test_prepare_raw_observation():
     assert isinstance(phone_img, torch.Tensor)
 
 
+def test_prepare_raw_observation_ignores_images_not_used_by_policy():
+    robot_obs = _create_mock_robot_observation()
+    lerobot_features = _create_mock_lerobot_features()
+    policy_image_features = _create_mock_policy_image_features()
+    policy_image_features.pop(f"{OBS_IMAGES}.phone")
+
+    prepared = prepare_raw_observation(robot_obs, lerobot_features, policy_image_features)
+
+    assert f"{OBS_IMAGES}.laptop" in prepared
+    assert f"{OBS_IMAGES}.phone" not in prepared
+
+
 def test_raw_observation_to_observation_basic():
     """Test the main raw_observation_to_observation function."""
     robot_obs = _create_mock_robot_observation()

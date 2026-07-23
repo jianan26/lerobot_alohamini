@@ -354,8 +354,9 @@ def test_action_key_sets_reject_unsupported_dimension():
     assert client.shutdown_event.is_set()
 
 
-def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
+def test_alohamini_async_config_builds_single_and_bimanual_action_key_sets():
     from lerobot.async_inference.alohamini_client import AlohaMiniAsyncClientConfig
+    from lerobot.async_inference.helpers import TimedAction
 
     cfg = AlohaMiniAsyncClientConfig(
         policy_type="act",
@@ -367,6 +368,8 @@ def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
 
     client_cfg = cfg.make_robot_client_config()
 
+    assert len(client_cfg.action_key_sets[7]) == 7
+    assert all(key.startswith("arm_right_") for key in client_cfg.action_key_sets[7])
     assert len(client_cfg.action_key_sets[14]) == 14
     assert len(client_cfg.action_key_sets[18]) == 18
     assert client_cfg.action_key_sets[18][:14] == client_cfg.action_key_sets[14]
@@ -379,3 +382,12 @@ def test_alohamini_async_config_builds_14_and_18_dim_action_key_sets():
     assert client_cfg.use_relative_state is True
     assert client_cfg.use_relative_actions is True
     assert "127.0.0.1:18080" in " ".join(cfg.ssh_command())
+
+    client = _action_validation_client(
+        {dimension: tuple(keys) for dimension, keys in client_cfg.action_key_sets.items()}
+    )
+    action = torch.arange(7, dtype=torch.float32)
+    assert client._accept_action_chunk([TimedAction(timestamp=0, timestep=0, action=action)])
+    assert client._action_tensor_to_action_dict(action) == {
+        key: float(index) for index, key in enumerate(client_cfg.action_key_sets[7])
+    }

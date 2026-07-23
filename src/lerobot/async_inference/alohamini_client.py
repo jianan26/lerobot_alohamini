@@ -74,7 +74,11 @@ class AlohaMiniAsyncClientConfig:
             aggregate_fn_name=self.aggregate_fn_name,
             use_relative_state=self.use_relative_state,
             use_relative_actions=self.use_relative_actions,
-            action_key_sets={14: arm_action_keys, 18: full_action_keys},
+            action_key_sets={
+                len(right_arm_keys): list(right_arm_keys),
+                len(arm_action_keys): arm_action_keys,
+                len(full_action_keys): full_action_keys,
+            },
         )
 
     def ssh_command(self) -> list[str]:
