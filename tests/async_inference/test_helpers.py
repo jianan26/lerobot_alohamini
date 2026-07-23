@@ -177,6 +177,34 @@ def test_timed_data_deserialization_data_getters():
     torch.testing.assert_close(to_out.get_previous_state(), previous_state)
 
 
+def test_jpeg_observation_payload_does_not_include_raw_images():
+    import cv2
+
+    images = {
+        name: np.full((480, 640, 3), index * 40, dtype=np.uint8)
+        for index, name in enumerate(("forward", "wrist_left", "wrist_right"), start=1)
+    }
+    jpeg_images = {}
+    for name, image in images.items():
+        encoded, data = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        assert encoded
+        jpeg_images[name] = data.tobytes()
+
+    raw_payload = pickle.dumps(
+        TimedObservation(timestamp=0, timestep=0, observation={**images, "task": "pick"})
+    )
+    jpeg_observation = TimedObservation(
+        timestamp=0,
+        timestep=0,
+        observation={"task": "pick"},
+        jpeg_images=jpeg_images,
+    )
+    jpeg_payload = pickle.dumps(jpeg_observation)
+
+    assert not any(isinstance(value, np.ndarray) for value in jpeg_observation.observation.values())
+    assert len(jpeg_payload) < len(raw_payload) / 10
+
+
 # ---------------------------------------------------------------------
 # observations_similar()
 # ---------------------------------------------------------------------

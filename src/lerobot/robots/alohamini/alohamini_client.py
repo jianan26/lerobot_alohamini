@@ -74,6 +74,7 @@ class AlohaMiniClient(Robot):
         self._observation_request_id = 0
 
         self.last_frames = {}
+        self.last_jpeg_images: dict[str, bytes] = {}
 
         self.last_remote_state = {}
         # Incremented only when a new observation message is successfully decoded.
@@ -266,21 +267,6 @@ class AlohaMiniClient(Robot):
             logging.error(f"Error decoding JSON observation: {e}")
             return None
 
-    def _decode_image_from_b64(self, image_b64: str) -> np.ndarray | None:
-        """Decodes a base64 encoded image string to an OpenCV image."""
-        if not image_b64:
-            return None
-        try:
-            jpg_data = base64.b64decode(image_b64)
-            np_arr = np.frombuffer(jpg_data, dtype=np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                logging.warning("cv2.imdecode returned None for an image.")
-            return frame
-        except (TypeError, ValueError) as e:
-            logging.error(f"Error decoding base64 image data: {e}")
-            return None
-
     def _decode_image_from_jpeg_bytes(self, jpg_data: bytes) -> np.ndarray | None:
         """Decodes JPEG bytes from a ZMQ multipart frame to an OpenCV image."""
         if not jpg_data:
@@ -292,7 +278,7 @@ class AlohaMiniClient(Robot):
 
     def _parse_observation_message(
         self, message_parts: list[bytes]
-    ) -> tuple[RobotObservation, dict[str, np.ndarray]] | None:
+    ) -> tuple[RobotObservation, dict[str, np.ndarray], dict[str, bytes]] | None:
         """Parse either the new multipart JPEG protocol or the legacy base64 JSON protocol."""
         parse_start_t = time.perf_counter()
         if not message_parts:
@@ -304,6 +290,7 @@ class AlohaMiniClient(Robot):
         json_done_t = time.perf_counter()
 
         encoded_frames: dict[str, np.ndarray] = {}
+        jpeg_images: dict[str, bytes] = {}
         decode_timings_ms: dict[str, float] = {}
         if len(message_parts) == 1:
             # Backward compatibility with the previous JSON/base64 protocol.
@@ -311,12 +298,17 @@ class AlohaMiniClient(Robot):
                 if cam_name not in self._cameras_ft:
                     continue
                 decode_start_t = time.perf_counter()
-                frame = self._decode_image_from_b64(image_b64)
+                try:
+                    jpg_data = base64.b64decode(image_b64)
+                except (TypeError, ValueError):
+                    jpg_data = b""
+                frame = self._decode_image_from_jpeg_bytes(jpg_data)
                 decode_timings_ms[f"decode_{cam_name}"] = (
                     time.perf_counter() - decode_start_t
                 ) * 1e3
                 if frame is not None:
                     encoded_frames[cam_name] = frame
+                    jpeg_images[cam_name] = jpg_data
         else:
             if (len(message_parts) - 1) % 2 != 0:
                 logging.warning("Invalid multipart observation: expected camera/JPEG pairs.")
@@ -329,12 +321,14 @@ class AlohaMiniClient(Robot):
                 if cam_name not in self._cameras_ft:
                     continue
                 decode_start_t = time.perf_counter()
-                frame = self._decode_image_from_jpeg_bytes(message_parts[index + 1])
+                jpg_data = message_parts[index + 1]
+                frame = self._decode_image_from_jpeg_bytes(jpg_data)
                 decode_timings_ms[f"decode_{cam_name}"] = (
                     time.perf_counter() - decode_start_t
                 ) * 1e3
                 if frame is not None:
                     encoded_frames[cam_name] = frame
+                    jpeg_images[cam_name] = jpg_data
 
         parse_done_t = time.perf_counter()
         self.logs["observation_decode_timing_ms"] = {
@@ -342,7 +336,7 @@ class AlohaMiniClient(Robot):
             **decode_timings_ms,
             "obs_parse_decode": (parse_done_t - parse_start_t) * 1e3,
         }
-        return observation, encoded_frames
+        return observation, encoded_frames, jpeg_images
 
     def _remote_state_from_obs(
         self, observation: RobotObservation, encoded_frames: dict[str, np.ndarray]
@@ -395,7 +389,7 @@ class AlohaMiniClient(Robot):
                 "obs_client_total": (parse_done_t - observation_start_t) * 1e3,
             }
             return self.last_frames, self.last_remote_state
-        observation, encoded_frames = parsed
+        observation, encoded_frames, jpeg_images = parsed
 
         # 4. Process the valid observation data
         try:
@@ -405,6 +399,7 @@ class AlohaMiniClient(Robot):
             return self.last_frames, self.last_remote_state
 
         self.last_frames = {**self.last_frames, **new_frames}
+        self.last_jpeg_images = {**self.last_jpeg_images, **jpeg_images}
         self.last_remote_state = new_state
         self._observation_sequence += 1
         observation_done_t = time.perf_counter()
@@ -437,6 +432,10 @@ class AlohaMiniClient(Robot):
 
 
         return obs_dict
+
+    def get_latest_jpeg_images(self) -> dict[str, bytes]:
+        """Return JPEG data corresponding to the frames from the latest observation."""
+        return dict(self.last_jpeg_images)
 
     def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray):
         # Speed control

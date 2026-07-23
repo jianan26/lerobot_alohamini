@@ -164,6 +164,15 @@ class RobotClientConfig:
     use_relative_actions: bool = field(
         default=False, metadata={"help": "Convert ACT relative action predictions back to absolute actions"}
     )
+    background_observation_send: bool = field(
+        default=False, metadata={"help": "Capture and send observations outside the control loop"}
+    )
+    observation_image_transport: str = field(
+        default="raw", metadata={"help": "Image transport format: raw or jpeg"}
+    )
+    inference_request_timeout_s: float = field(
+        default=10.0, metadata={"help": "Maximum wait for an action chunk from one observation"}
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -222,6 +231,17 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.observation_image_transport not in {"raw", "jpeg"}:
+            raise ValueError(
+                "observation_image_transport must be 'raw' or 'jpeg', "
+                f"got {self.observation_image_transport!r}"
+            )
+
+        if self.inference_request_timeout_s <= 0:
+            raise ValueError(
+                f"inference_request_timeout_s must be positive, got {self.inference_request_timeout_s}"
+            )
+
         if self.action_key_sets is not None:
             for action_dim, keys in self.action_key_sets.items():
                 if action_dim <= 0:
@@ -250,6 +270,9 @@ class RobotClientConfig:
             "fps": self.fps,
             "use_relative_state": self.use_relative_state,
             "use_relative_actions": self.use_relative_actions,
+            "background_observation_send": self.background_observation_send,
+            "observation_image_transport": self.observation_image_transport,
+            "inference_request_timeout_s": self.inference_request_timeout_s,
             "actions_per_chunk": self.actions_per_chunk,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,

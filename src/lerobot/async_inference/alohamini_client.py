@@ -32,6 +32,15 @@ class AlohaMiniAsyncClientConfig:
     use_relative_actions: bool = field(
         default=False, metadata={"help": "Convert ACT relative predictions to absolute actions"}
     )
+    background_observation_send: bool = field(
+        default=True, metadata={"help": "Capture and upload observations on a dedicated thread"}
+    )
+    observation_image_transport: str = field(
+        default="jpeg", metadata={"help": "Image transport format: raw or jpeg"}
+    )
+    inference_request_timeout_s: float = field(
+        default=10.0, metadata={"help": "Maximum wait for a matching action chunk"}
+    )
     diagnostics: bool = field(default=False, metadata={"help": "Enable diagnostic recording"})
     diagnostics_dir: Path = field(
         default=Path("logs/async_diagnostics"),
@@ -81,6 +90,9 @@ class AlohaMiniAsyncClientConfig:
             aggregate_fn_name=self.aggregate_fn_name,
             use_relative_state=self.use_relative_state,
             use_relative_actions=self.use_relative_actions,
+            background_observation_send=self.background_observation_send,
+            observation_image_transport=self.observation_image_transport,
+            inference_request_timeout_s=self.inference_request_timeout_s,
             diagnostics=self.diagnostics,
             diagnostics_dir=self.diagnostics_dir,
             diagnostics_session_id=self.diagnostics_session_id,

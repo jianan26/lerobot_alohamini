@@ -19,9 +19,12 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import pickle  # nosec
+import threading
 import time
 from queue import Queue
 
+import numpy as np
 import pytest
 import torch
 
@@ -405,6 +408,9 @@ def test_alohamini_async_config_builds_single_and_bimanual_action_key_sets():
     ]
     assert client_cfg.use_relative_state is True
     assert client_cfg.use_relative_actions is True
+    assert client_cfg.background_observation_send is True
+    assert client_cfg.observation_image_transport == "jpeg"
+    assert client_cfg.inference_request_timeout_s == 10.0
     assert client_cfg.diagnostics is True
     assert client_cfg.diagnostics_session_id == "slow_motion_001"
     assert "127.0.0.1:18080" in " ".join(cfg.ssh_command())
@@ -417,3 +423,231 @@ def test_alohamini_async_config_builds_single_and_bimanual_action_key_sets():
     assert client._action_tensor_to_action_dict(action) == {
         key: float(index) for index, key in enumerate(client_cfg.action_key_sets[7])
     }
+
+
+def test_regular_robot_client_keeps_synchronous_raw_defaults(robot_client):
+    assert robot_client.config.background_observation_send is False
+    assert robot_client.config.observation_image_transport == "raw"
+
+
+def test_background_jpeg_observation_uses_raw_fallback(robot_client, monkeypatch):
+    camera_a = np.zeros((8, 8, 3), dtype=np.uint8)
+    camera_b = np.ones((8, 8, 3), dtype=np.uint8)
+    robot_client.config.background_observation_send = True
+    robot_client.config.observation_image_transport = "jpeg"
+    monkeypatch.setattr(
+        robot_client.robot,
+        "get_observation",
+        lambda: {
+            "motor_1.pos": 1.0,
+            "motor_2.pos": 2.0,
+            "motor_3.pos": 3.0,
+            "camera_a": camera_a,
+            "camera_b": camera_b,
+        },
+    )
+    monkeypatch.setattr(
+        robot_client.robot,
+        "get_latest_jpeg_images",
+        lambda: {"camera_a": b"host-jpeg"},
+        raising=False,
+    )
+
+    observation = robot_client._capture_background_observation("pick")
+
+    assert observation.must_go is True
+    assert observation.jpeg_images == {"camera_a": b"host-jpeg"}
+    assert "camera_a" not in observation.observation
+    assert observation.observation["camera_b"] is camera_b
+    assert observation.observation["task"] == "pick"
+
+
+def test_background_relative_state_samples_previous_then_current(robot_client, monkeypatch):
+    observations = iter(
+        [
+            {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+            {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0},
+        ]
+    )
+    robot_client.config.background_observation_send = True
+    robot_client.config.use_relative_state = True
+    monkeypatch.setattr(robot_client.robot, "get_observation", lambda: next(observations))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    observation = robot_client._capture_background_observation("task")
+
+    assert observation.observation["motor_1.pos"] == 4.0
+    torch.testing.assert_close(observation.previous_state, torch.tensor([[1.0, 2.0, 3.0]]))
+
+
+def test_refill_triggers_are_merged_while_request_is_pending(robot_client):
+    robot_client.config.background_observation_send = True
+    robot_client._pending_request_id = 7
+
+    robot_client._request_refill("first")
+    robot_client._request_refill("second")
+
+    assert not robot_client.refill_event.is_set()
+    assert robot_client._merged_refill_triggers == 2
+
+
+def test_background_rpc_failure_safely_stops(robot_client, monkeypatch):
+    from lerobot.async_inference.helpers import TimedObservation
+
+    robot_client.config.background_observation_send = True
+    robot_client.refill_event.set()
+    monkeypatch.setattr(
+        robot_client,
+        "_capture_background_observation",
+        lambda _task: TimedObservation(timestamp=time.time(), timestep=0, observation={}),
+    )
+    monkeypatch.setattr(robot_client, "send_observation", lambda _obs, timeout=None: False)
+
+    robot_client.send_observations_in_background("task")
+
+    assert robot_client.shutdown_event.is_set()
+    assert robot_client.action_queue.empty()
+
+
+def test_blocked_observation_rpc_does_not_block_action_dispatch(robot_client, monkeypatch):
+    from lerobot.async_inference.helpers import TimedAction, TimedObservation
+
+    rpc_started = threading.Event()
+    release_rpc = threading.Event()
+    robot_client.config.background_observation_send = True
+    robot_client.config.inference_request_timeout_s = 1.0
+    robot_client.refill_event.set()
+    robot_client._active_action_dim = 6
+    robot_client.action_queue.put(
+        TimedAction(timestamp=time.time(), timestep=1, action=torch.ones(6))
+    )
+    monkeypatch.setattr(
+        robot_client,
+        "_capture_background_observation",
+        lambda _task: TimedObservation(timestamp=time.time(), timestep=0, observation={}),
+    )
+
+    def blocked_send(_observation, timeout=None):
+        rpc_started.set()
+        release_rpc.wait(1)
+        return True
+
+    monkeypatch.setattr(robot_client, "send_observation", blocked_send)
+    sender = threading.Thread(target=robot_client.send_observations_in_background, args=("task",))
+    sender.start()
+    assert rpc_started.wait(1)
+
+    performed = robot_client.control_loop_action()
+
+    assert performed is not None
+    release_rpc.set()
+    robot_client.shutdown_event.set()
+    robot_client._pending_request_id = None
+    robot_client._pending_chunk_received.set()
+    sender.join(1)
+    assert not sender.is_alive()
+
+
+def test_background_receiver_only_accepts_matching_request_id(robot_client):
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.transport import services_pb2
+
+    wrong = [
+        TimedAction(
+            timestamp=time.time(),
+            timestep=1,
+            action=torch.ones(6),
+            source_request_ids=(1,),
+        )
+    ]
+    matching = [
+        TimedAction(
+            timestamp=time.time(),
+            timestep=2,
+            action=torch.full((6,), 2.0),
+            source_request_ids=(2,),
+        )
+    ]
+
+    class Stub:
+        def __init__(self):
+            self.responses = iter((wrong, matching))
+
+        def GetActions(self, _request):  # noqa: N802
+            try:
+                actions = next(self.responses)
+            except StopIteration:
+                robot_client.shutdown_event.set()
+                return services_pb2.Actions()
+            return services_pb2.Actions(data=pickle.dumps(actions))
+
+    robot_client.config.background_observation_send = True
+    robot_client.stub = Stub()
+    robot_client._pending_request_id = 2
+    robot_client._pending_request_started_at = time.monotonic()
+    receiver = threading.Thread(target=robot_client.receive_actions)
+    receiver.start()
+    robot_client.start_barrier.wait()
+    receiver.join(1)
+
+    assert not receiver.is_alive()
+    assert robot_client._pending_request_id is None
+    assert [action.source_request_ids for action in robot_client.action_queue.queue] == [(2,)]
+
+
+def test_background_request_timeout_sends_once_and_safely_stops(robot_client, monkeypatch):
+    from lerobot.async_inference.helpers import TimedObservation
+
+    send_count = 0
+    robot_client.config.background_observation_send = True
+    robot_client.config.inference_request_timeout_s = 0.01
+    robot_client.refill_event.set()
+    monkeypatch.setattr(
+        robot_client,
+        "_capture_background_observation",
+        lambda _task: TimedObservation(timestamp=time.time(), timestep=0, observation={}),
+    )
+
+    def send(_observation, timeout=None):
+        nonlocal send_count
+        send_count += 1
+        robot_client._request_refill("duplicate-threshold")
+        return True
+
+    monkeypatch.setattr(robot_client, "send_observation", send)
+
+    robot_client.send_observations_in_background("task")
+
+    assert send_count == 1
+    assert robot_client.shutdown_event.is_set()
+    assert robot_client.action_queue.empty()
+
+
+def test_background_stop_joins_workers_before_robot_disconnect(robot_client, monkeypatch):
+    order = []
+    original_disconnect = robot_client.robot.disconnect
+    robot_client.config.background_observation_send = True
+
+    class Channel:
+        def close(self):
+            order.append("channel_closed")
+
+    robot_client.channel = Channel()
+
+    def worker():
+        robot_client.shutdown_event.wait()
+        order.append("worker_exited")
+
+    thread = threading.Thread(target=worker)
+    robot_client._worker_threads = [thread]
+    thread.start()
+
+    def disconnect():
+        order.append("robot_disconnected")
+        original_disconnect()
+
+    monkeypatch.setattr(robot_client.robot, "disconnect", disconnect)
+
+    robot_client.stop()
+
+    assert order == ["channel_closed", "worker_exited", "robot_disconnected"]

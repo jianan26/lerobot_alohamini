@@ -18,7 +18,10 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 from __future__ import annotations
 
 import time
+from types import SimpleNamespace
 
+import cv2
+import numpy as np
 import pytest
 import torch
 
@@ -225,6 +228,74 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+def test_jpeg_and_raw_observations_follow_same_policy_path(monkeypatch, policy_server):
+    from lerobot.async_inference.helpers import TimedObservation
+
+    image_feature = PolicyFeature(type=FeatureType.VISUAL, shape=(3, 8, 8))
+    policy_server.policy.config = SimpleNamespace(
+        image_features={"observation.images.camera": image_feature},
+        input_features={OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(6,))},
+        output_features={"action": PolicyFeature(type=FeatureType.ACTION, shape=(6,))},
+        single_arm=False,
+    )
+    policy_server.policy_type = "act"
+    policy_server.preprocessor = lambda observation: observation
+    policy_server.postprocessor = lambda action: action
+    policy_server.actions_per_chunk = 2
+    policy_server.lerobot_features["observation.images.camera"] = {
+        "dtype": "image",
+        "shape": (8, 8, 3),
+        "names": ["height", "width", "channels"],
+    }
+    captured = []
+
+    def fake_action_chunk(observation):
+        captured.append(
+            (observation[OBS_STATE].clone(), observation["observation.images.camera"].shape)
+        )
+        return torch.zeros(1, 2, 6)
+
+    monkeypatch.setattr(policy_server, "_get_action_chunk", fake_action_chunk)
+    frame = np.full((8, 8, 3), 127, dtype=np.uint8)
+    encoded, jpeg = cv2.imencode(".jpg", frame)
+    assert encoded
+    state = {f"joint{index}": float(index) for index in range(1, 7)}
+    raw = TimedObservation(
+        timestamp=time.time(), timestep=0, request_id=1, observation={**state, "camera": frame}
+    )
+    compressed = TimedObservation(
+        timestamp=time.time(),
+        timestep=0,
+        request_id=2,
+        observation=state.copy(),
+        jpeg_images={"camera": jpeg.tobytes()},
+    )
+
+    raw_actions = policy_server._predict_action_chunk(raw)
+    jpeg_actions = policy_server._predict_action_chunk(compressed)
+
+    assert captured[0][1] == captured[1][1] == torch.Size([1, 3, 8, 8])
+    torch.testing.assert_close(captured[0][0], captured[1][0])
+    assert [action.get_action().tolist() for action in raw_actions] == [
+        action.get_action().tolist() for action in jpeg_actions
+    ]
+
+
+def test_invalid_jpeg_fails_with_camera_name(policy_server):
+    from lerobot.async_inference.helpers import TimedObservation
+
+    observation = TimedObservation(
+        timestamp=time.time(),
+        timestep=0,
+        request_id=42,
+        observation={},
+        jpeg_images={"camera": b"not-a-jpeg"},
+    )
+
+    with pytest.raises(ValueError, match="camera"):
+        policy_server._decode_jpeg_images(observation)
 
 
 @pytest.mark.parametrize("use_relative_state", [False, True])

@@ -136,6 +136,17 @@ class RobotClient:
         self.action_queue_lock = threading.Lock()  # Protect queue operations
         self.action_queue_size = []
         self.start_barrier = threading.Barrier(2)  # 2 threads: action receiver, control loop
+        self._worker_threads: list[threading.Thread] = []
+
+        # Background observation mode is opt-in so other robot clients keep their
+        # existing single-threaded hardware access.
+        self.refill_event = threading.Event()
+        self._pending_request_lock = threading.Lock()
+        self._pending_request_id: int | None = None
+        self._pending_request_started_at: float | None = None
+        self._pending_chunk_received = threading.Event()
+        self._refill_below_threshold = True
+        self._merged_refill_triggers = 0
 
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
@@ -256,6 +267,9 @@ class RobotClient:
 
             self.shutdown_event.clear()
             self._last_observation_state = None
+            if self.config.background_observation_send:
+                self.refill_event.set()
+                self._record_diagnostic("refill_triggered", reason="startup", pending_request_id=None)
 
             return True
 
@@ -267,16 +281,26 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
 
+        if self.config.background_observation_send:
+            self.refill_event.set()
+            self._pending_chunk_received.set()
+            self.channel.close()
+            for thread in self._worker_threads:
+                if thread is not threading.current_thread():
+                    thread.join()
+
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
-        self.channel.close()
+        if not self.config.background_observation_send:
+            self.channel.close()
         self.logger.debug("Client stopped, channel closed")
         self.diagnostics.close()
 
     def send_observation(
         self,
         obs: TimedObservation,
+        timeout: float | None = None,
     ) -> bool:
         """Send observation to the policy server.
         Returns True if the observation was sent successfully, False otherwise."""
@@ -299,7 +323,10 @@ class RobotClient:
                 silent=True,
             )
             rpc_start = time.perf_counter()
-            _ = self.stub.SendObservations(observation_iterator)
+            if timeout is None:
+                _ = self.stub.SendObservations(observation_iterator)
+            else:
+                _ = self.stub.SendObservations(observation_iterator, timeout=timeout)
             rpc_time = time.perf_counter() - rpc_start
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
@@ -311,6 +338,13 @@ class RobotClient:
                 observation_timestamp=obs.get_timestamp(),
                 serialization_ms=serialize_time * 1000,
                 rpc_ms=rpc_time * 1000,
+                payload_bytes=len(observation_bytes),
+                jpeg_bytes=sum(len(data) for data in (obs.jpeg_images or {}).values()),
+                raw_image_bytes=sum(
+                    value.nbytes
+                    for value in obs.get_observation().values()
+                    if hasattr(value, "ndim") and value.ndim == 3
+                ),
             )
 
             return True
@@ -402,6 +436,27 @@ class RobotClient:
                 timed_actions = pickle.loads(actions_chunk.data)  # nosec
                 deserialize_time = time.perf_counter() - deserialize_start
 
+                if self.config.background_observation_send:
+                    source_request_ids = {
+                        request_id
+                        for action in timed_actions
+                        for request_id in action.source_request_ids
+                    }
+                    with self._pending_request_lock:
+                        pending_request_id = self._pending_request_id
+                    if pending_request_id is None or source_request_ids != {pending_request_id}:
+                        self.logger.error(
+                            "Dropping action chunk with source request IDs %s; pending request is %s",
+                            sorted(source_request_ids),
+                            pending_request_id,
+                        )
+                        self._record_diagnostic(
+                            "action_chunk_dropped",
+                            source_request_ids=sorted(source_request_ids),
+                            pending_request_id=pending_request_id,
+                        )
+                        continue
+
                 if not self._accept_action_chunk(timed_actions):
                     break
 
@@ -487,6 +542,28 @@ class RobotClient:
 
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
+                if self.config.background_observation_send:
+                    with self._pending_request_lock:
+                        if self._pending_request_id == pending_request_id:
+                            wait_ms = (
+                                time.monotonic() - self._pending_request_started_at
+                            ) * 1000
+                            self._pending_request_id = None
+                            self._pending_request_started_at = None
+                        else:
+                            wait_ms = None
+                    self._pending_chunk_received.set()
+                    self._record_diagnostic(
+                        "inference_request_completed",
+                        request_id=pending_request_id,
+                        wait_ms=wait_ms,
+                    )
+                    with self.action_queue_lock:
+                        below_threshold = self._queue_below_refill_threshold_locked()
+                    self._refill_below_threshold = below_threshold
+                    if below_threshold:
+                        self._request_refill("received_chunk_below_threshold")
+
                 if verbose:
                     # Get queue state after changes
                     new_size, new_timesteps = self._inspect_action_queue()
@@ -507,7 +584,8 @@ class RobotClient:
                     )
 
             except grpc.RpcError as e:
-                self.logger.error(f"Error receiving actions: {e}")
+                if self.running:
+                    self.logger.error(f"Error receiving actions: {e}")
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
@@ -547,6 +625,8 @@ class RobotClient:
 
         with self.action_queue_lock:
             remaining_queue_size = self.action_queue.qsize()
+        if self.config.background_observation_send:
+            self._update_refill_state("threshold_crossed")
         self._record_diagnostic(
             "action_dispatched",
             timestep=timed_action.get_timestep(),
@@ -579,7 +659,145 @@ class RobotClient:
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
         with self.action_queue_lock:
-            return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+            return self._queue_below_refill_threshold_locked()
+
+    def _queue_below_refill_threshold_locked(self) -> bool:
+        if self.action_chunk_size <= 0:
+            return True
+        return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
+
+    def _request_refill(self, reason: str) -> None:
+        with self._pending_request_lock:
+            pending_request_id = self._pending_request_id
+        if pending_request_id is not None or self.refill_event.is_set():
+            self._merged_refill_triggers += 1
+            self._record_diagnostic(
+                "refill_trigger_merged",
+                reason=reason,
+                pending_request_id=pending_request_id,
+                merged_count=self._merged_refill_triggers,
+            )
+            return
+        self.refill_event.set()
+        self._record_diagnostic("refill_triggered", reason=reason, pending_request_id=None)
+
+    def _update_refill_state(self, reason: str) -> None:
+        with self.action_queue_lock:
+            below_threshold = self._queue_below_refill_threshold_locked()
+        if below_threshold and not self._refill_below_threshold:
+            self._refill_below_threshold = True
+            self._request_refill(reason)
+        elif not below_threshold:
+            self._refill_below_threshold = False
+
+    def _capture_background_observation(self, task: str) -> TimedObservation:
+        capture_start = time.perf_counter()
+        previous_state = None
+
+        if self.config.use_relative_state:
+            first_capture_start = time.perf_counter()
+            first_raw_observation = self.robot.get_observation()
+            first_state = extract_state_from_raw_observation(
+                make_lerobot_observation(first_raw_observation, self.lerobot_features)
+            )
+            time.sleep(
+                max(0, self.config.environment_dt - (time.perf_counter() - first_capture_start))
+            )
+            raw_observation: RawObservation = self.robot.get_observation()
+            previous_state = first_state
+        else:
+            raw_observation = self.robot.get_observation()
+
+        raw_observation["task"] = task
+        jpeg_images = None
+        if self.config.observation_image_transport == "jpeg":
+            get_jpeg_images = getattr(self.robot, "get_latest_jpeg_images", None)
+            if get_jpeg_images is None:
+                raise RuntimeError("JPEG transport requires a robot with get_latest_jpeg_images()")
+            available_jpegs = get_jpeg_images()
+            jpeg_images = {
+                name: data for name, data in available_jpegs.items() if name in raw_observation
+            }
+            raw_observation = {
+                name: value for name, value in raw_observation.items() if name not in jpeg_images
+            }
+
+        with self.latest_action_lock:
+            latest_action = self.latest_action
+
+        observation = TimedObservation(
+            timestamp=time.time(),
+            observation=raw_observation,
+            timestep=max(latest_action, 0),
+            must_go=True,
+            previous_state=previous_state,
+            jpeg_images=jpeg_images,
+        )
+        self._record_diagnostic(
+            "observation_captured",
+            timestep=observation.get_timestep(),
+            capture_ms=(time.perf_counter() - capture_start) * 1000,
+            must_go=True,
+            image_transport=self.config.observation_image_transport,
+            jpeg_camera_bytes={name: len(data) for name, data in (jpeg_images or {}).items()},
+            robot_timings=getattr(self.robot, "logs", {}),
+        )
+        return observation
+
+    def _fail_background_request(self, event: str, request_id: int, **payload: Any) -> None:
+        self.logger.error("Stopping after %s for inference request %s", event, request_id)
+        with self.action_queue_lock:
+            self.action_queue = Queue()
+        self._record_diagnostic(event, request_id=request_id, **payload)
+        self.shutdown_event.set()
+        self.refill_event.set()
+
+    def send_observations_in_background(self, task: str) -> None:
+        """Capture and synchronously upload at most one inference request at a time."""
+        self.logger.info("Background observation thread starting")
+        while self.running:
+            self.refill_event.wait()
+            self.refill_event.clear()
+            if not self.running:
+                break
+
+            try:
+                observation = self._capture_background_observation(task)
+            except Exception:
+                self.logger.exception("Error capturing background observation")
+                self.shutdown_event.set()
+                break
+
+            with self._pending_request_lock:
+                self._observation_request_id += 1
+                request_id = self._observation_request_id
+                observation.request_id = request_id
+                self._pending_request_id = request_id
+                self._pending_request_started_at = time.monotonic()
+                self._pending_chunk_received.clear()
+            self._record_diagnostic("inference_request_pending", request_id=request_id, reason="refill")
+
+            if not self.send_observation(
+                observation, timeout=self.config.inference_request_timeout_s
+            ):
+                self._fail_background_request("inference_request_rpc_failed", request_id)
+                break
+
+            with self._pending_request_lock:
+                started_at = self._pending_request_started_at
+            remaining = self.config.inference_request_timeout_s
+            if started_at is not None:
+                remaining -= time.monotonic() - started_at
+            if remaining <= 0 or not self._pending_chunk_received.wait(remaining):
+                with self._pending_request_lock:
+                    still_pending = self._pending_request_id == request_id
+                if still_pending:
+                    self._fail_background_request(
+                        "inference_request_timeout",
+                        request_id,
+                        timeout_s=self.config.inference_request_timeout_s,
+                    )
+                    break
 
     def control_loop_observation(self, task: str, verbose: bool = False, send: bool = True) -> RawObservation:
         try:
@@ -677,11 +895,12 @@ class RobotClient:
                 _performed_action = self.control_loop_action(verbose)
                 action_executed = True
 
-            """Control loop: (2) Streaming observations to the remote policy server"""
-            ready_to_send = self._ready_to_send_observation()
-            if self.config.use_relative_state or ready_to_send:
-                _captured_observation = self.control_loop_observation(task, verbose, send=ready_to_send)
-                observation_captured = True
+            if not self.config.background_observation_send:
+                """Control loop: (2) Streaming observations to the remote policy server"""
+                ready_to_send = self._ready_to_send_observation()
+                if self.config.use_relative_state or ready_to_send:
+                    _captured_observation = self.control_loop_observation(task, verbose, send=ready_to_send)
+                    observation_captured = True
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             self._record_diagnostic(
@@ -709,7 +928,18 @@ def run_robot_client(
 
         client.logger.info("Starting action receiver thread...")
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
+        client._worker_threads.append(action_receiver_thread)
         action_receiver_thread.start()
+
+        if cfg.background_observation_send:
+            client.logger.info("Starting background observation thread...")
+            observation_sender_thread = threading.Thread(
+                target=client.send_observations_in_background,
+                args=(cfg.task,),
+                daemon=True,
+            )
+            client._worker_threads.append(observation_sender_thread)
+            observation_sender_thread.start()
 
         if on_started is not None:
             on_started(client)
@@ -718,7 +948,8 @@ def run_robot_client(
             client.control_loop(task=cfg.task)
         finally:
             client.stop()
-            action_receiver_thread.join()
+            if not cfg.background_observation_send:
+                action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")

@@ -34,6 +34,7 @@ from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
 
+import cv2
 import draccus
 import grpc
 import numpy as np
@@ -286,6 +287,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             deserialize_ms=deserialize_time * 1000,
             server_receive_time=receive_time,
             client_timestamp=obs_timestamp,
+            jpeg_bytes=sum(len(data) for data in (timed_observation.jpeg_images or {}).values()),
+            jpeg_camera_bytes={
+                name: len(data) for name, data in (timed_observation.jpeg_images or {}).items()
+            },
         )
         if sample_payload is not None:
             state, images = sample_payload
@@ -435,6 +440,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
+        self._decode_jpeg_images(observation_t)
         observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
@@ -563,6 +569,47 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
 
         return action_chunk
+
+    def _decode_jpeg_images(self, observation_t: TimedObservation) -> None:
+        jpeg_images = observation_t.jpeg_images or {}
+        raw_observation = observation_t.get_observation()
+        decoded_shapes = {}
+        decode_start = time.perf_counter()
+
+        for camera_name, jpeg_data in jpeg_images.items():
+            frame = cv2.imdecode(np.frombuffer(jpeg_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                self.logger.error(
+                    "JPEG decode failed for request %s camera %s",
+                    observation_t.request_id,
+                    camera_name,
+                )
+                raise ValueError(f"Could not decode JPEG camera {camera_name!r}")
+            raw_observation[camera_name] = frame
+            decoded_shapes[camera_name] = list(frame.shape)
+
+        required_cameras = {
+            key.removeprefix("observation.images.")
+            for key in self.policy_image_features
+            if key in self.lerobot_features
+        }
+        missing_cameras = sorted(required_cameras - raw_observation.keys())
+        if missing_cameras:
+            self.logger.error(
+                "Request %s is missing policy cameras %s",
+                observation_t.request_id,
+                missing_cameras,
+            )
+            raise ValueError(f"Missing policy cameras: {missing_cameras}")
+
+        self.diagnostics.record_event(
+            "jpeg_images_decoded",
+            request_id=observation_t.request_id,
+            jpeg_bytes=sum(len(data) for data in jpeg_images.values()),
+            jpeg_camera_bytes={name: len(data) for name, data in jpeg_images.items()},
+            decode_ms=(time.perf_counter() - decode_start) * 1000,
+            decoded_shapes=decoded_shapes,
+        )
 
     def stop(self):
         """Stop the server"""

@@ -222,6 +222,7 @@ class TimedObservation(TimedData):
     must_go: bool = False
     previous_state: torch.Tensor | None = None
     request_id: int | None = None
+    jpeg_images: dict[str, bytes] | None = None
 
     def get_observation(self):
         return self.observation
