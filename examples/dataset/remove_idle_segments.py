@@ -33,7 +33,8 @@ Example for AlohaMini arm-only cleaning:
     uv run python examples/dataset/remove_idle_segments.py \
         --repo-id user/source --root /data/source \
         --output-repo-id user/source_clean --output-root /data/source_clean \
-        --arm-dim-regex '^arm_' --report-path idle_report.json --write
+        --arm-dim-regex '^arm_' --resize-images \
+        --report-path idle_report.json --write
 """
 
 from __future__ import annotations
@@ -43,10 +44,12 @@ import json
 import logging
 import math
 import re
+import time
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 
@@ -342,7 +345,14 @@ def analyze_dataset(
     return plans, report
 
 
-def _encoder_configs(dataset: LeRobotDataset) -> tuple[RGBEncoderConfig | None, DepthEncoderConfig | None]:
+def _encoder_configs(
+    dataset: LeRobotDataset,
+    *,
+    output_video_codec: str,
+    h264_crf: int,
+    h264_preset: str,
+    h264_gop: int,
+) -> tuple[RGBEncoderConfig | None, DepthEncoderConfig | None]:
     rgb_encoder = None
     depth_encoder = None
     for key in dataset.meta.video_keys:
@@ -351,27 +361,87 @@ def _encoder_configs(dataset: LeRobotDataset) -> tuple[RGBEncoderConfig | None, 
             depth_encoder = config
         elif isinstance(config, RGBEncoderConfig) and rgb_encoder is None:
             rgb_encoder = config
+    if output_video_codec == "h264" and rgb_encoder is not None:
+        rgb_encoder = RGBEncoderConfig(
+            vcodec="h264", pix_fmt="yuv420p", crf=h264_crf, preset=h264_preset, g=h264_gop
+        )
     return rgb_encoder, depth_encoder
 
 
-def _writer_frame(dataset: LeRobotDataset, index: int, features: dict) -> dict:
-    item = dataset[index]
-    frame = {"task": item["task"]}
+def _letterbox_resize(image: np.ndarray, size: int = 224) -> np.ndarray:
+    """Pad an HWC image to square with black pixels, then resize it."""
+    height, width = image.shape[:2]
+    square_size = max(height, width)
+    canvas = np.zeros((square_size, square_size, image.shape[2]), dtype=image.dtype)
+    top = (square_size - height) // 2
+    left = (square_size - width) // 2
+    canvas[top : top + height, left : left + width] = image
+    return cv2.resize(canvas, (size, size), interpolation=cv2.INTER_AREA)
+
+
+def _output_features(source: LeRobotDataset, resize_images: bool) -> dict:
+    features = {
+        key: deepcopy(value) for key, value in source.meta.features.items() if key not in DEFAULT_FEATURES
+    }
+    if not resize_images:
+        return features
     for key, feature in features.items():
-        value = item[key]
-        if isinstance(value, torch.Tensor):
-            value = value.cpu().numpy()
-        if feature["dtype"] not in {"image", "video"} and tuple(feature["shape"]) == (1,):
-            value = np.asarray(value).reshape(1)
-        if feature["dtype"] in {"image", "video"}:
-            value = np.asarray(value)
-            expected_shape = tuple(feature["shape"])
-            if value.ndim == 3 and value.shape == (expected_shape[2], expected_shape[0], expected_shape[1]):
-                value = np.transpose(value, (1, 2, 0))
-            if key not in dataset.meta.depth_keys and np.issubdtype(value.dtype, np.floating):
-                value = np.rint(np.clip(value, 0.0, 1.0) * 255).astype(np.uint8)
-        frame[key] = value
-    return frame
+        if feature["dtype"] not in {"image", "video"} or key in source.meta.depth_keys:
+            continue
+        feature["shape"] = (224, 224, 3)
+        info = feature.get("info")
+        if info is not None:
+            info["video.height"] = 224
+            info["video.width"] = 224
+    return features
+
+
+def _as_hwc(value: torch.Tensor | np.ndarray, expected_shape: tuple[int, ...]) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.cpu().numpy()
+    value = np.asarray(value)
+    if value.ndim == 3 and value.shape == (expected_shape[2], expected_shape[0], expected_shape[1]):
+        value = np.transpose(value, (1, 2, 0))
+    return value
+
+
+def _batch_writer_frames(
+    dataset: LeRobotDataset,
+    indices: list[int],
+    features: dict,
+    *,
+    episode_index: int,
+    resize_images: bool,
+) -> list[dict]:
+    rows = dataset.hf_dataset[indices]
+    video_frames: dict[str, torch.Tensor] = {}
+    if dataset.meta.video_keys:
+        timestamps = [float(timestamp) for timestamp in rows["timestamp"]]
+        query_timestamps = dict.fromkeys(dataset.meta.video_keys, timestamps)
+        video_frames = dataset.reader._query_videos(query_timestamps, episode_index)
+        video_frames = {
+            key: value.unsqueeze(0) if value.ndim == 3 else value for key, value in video_frames.items()
+        }
+
+    frames = []
+    for batch_index in range(len(indices)):
+        task_index = int(rows["task_index"][batch_index])
+        frame = {"task": dataset.meta.tasks.iloc[task_index].name}
+        for key, feature in features.items():
+            value = video_frames[key][batch_index] if key in video_frames else rows[key][batch_index]
+            if feature["dtype"] in {"image", "video"}:
+                value = _as_hwc(value, tuple(dataset.meta.features[key]["shape"]))
+                if key not in dataset.meta.depth_keys and np.issubdtype(value.dtype, np.floating):
+                    value = np.rint(np.clip(value, 0.0, 1.0) * 255).astype(np.uint8)
+                if resize_images and key not in dataset.meta.depth_keys:
+                    value = _letterbox_resize(value)
+            elif isinstance(value, torch.Tensor):
+                value = value.cpu().numpy()
+            if feature["dtype"] not in {"image", "video"} and tuple(feature["shape"]) == (1,):
+                value = np.asarray(value).reshape(1)
+            frame[key] = value
+        frames.append(frame)
+    return frames
 
 
 def rebuild_dataset(
@@ -380,11 +450,29 @@ def rebuild_dataset(
     *,
     output_repo_id: str,
     output_root: Path,
+    decode_batch_size: int = 32,
+    image_writer_threads: int = 8,
+    output_video_codec: str = "h264",
+    h264_crf: int = 18,
+    h264_preset: str = "fast",
+    h264_gop: int = 30,
+    resize_images: bool = False,
 ) -> LeRobotDataset:
-    features = {
-        key: deepcopy(value) for key, value in source.meta.features.items() if key not in DEFAULT_FEATURES
-    }
-    rgb_encoder, depth_encoder = _encoder_configs(source)
+    if decode_batch_size <= 0:
+        raise ValueError("decode batch size must be positive")
+    if image_writer_threads < 0:
+        raise ValueError("image writer threads must be non-negative")
+    if output_video_codec not in {"h264", "source"}:
+        raise ValueError("output video codec must be 'h264' or 'source'")
+
+    features = _output_features(source, resize_images)
+    rgb_encoder, depth_encoder = _encoder_configs(
+        source,
+        output_video_codec=output_video_codec,
+        h264_crf=h264_crf,
+        h264_preset=h264_preset,
+        h264_gop=h264_gop,
+    )
     cleaned = LeRobotDataset.create(
         repo_id=output_repo_id,
         root=output_root,
@@ -392,6 +480,7 @@ def rebuild_dataset(
         features=features,
         robot_type=source.meta.robot_type,
         use_videos=bool(source.meta.video_keys),
+        image_writer_threads=image_writer_threads,
         rgb_encoder=rgb_encoder,
         depth_encoder=depth_encoder,
         data_files_size_in_mb=source.meta.data_files_size_in_mb,
@@ -402,10 +491,18 @@ def rebuild_dataset(
         for plan in plans:
             if plan.kept_frames < 2:
                 continue
-            for relative_index in plan.keep_indices:
-                cleaned.add_frame(
-                    _writer_frame(source, plan.source_from_index + int(relative_index), features)
+            absolute_indices = plan.source_from_index + plan.keep_indices
+            for batch_start in range(0, plan.kept_frames, decode_batch_size):
+                batch_indices = absolute_indices[batch_start : batch_start + decode_batch_size].tolist()
+                frames = _batch_writer_frames(
+                    source,
+                    batch_indices,
+                    features,
+                    episode_index=plan.episode_index,
+                    resize_images=resize_images,
                 )
+                for frame in frames:
+                    cleaned.add_frame(frame)
             cleaned.save_episode()
     finally:
         cleaned.finalize()
@@ -426,6 +523,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--idle-threshold", type=float, default=0.001)
     parser.add_argument("--min-idle-seconds", type=float, default=0.5)
     parser.add_argument("--smooth-window", type=int, default=3)
+    parser.add_argument("--decode-batch-size", type=int, default=32)
+    parser.add_argument("--image-writer-threads", type=int, default=8)
+    parser.add_argument("--output-video-codec", choices=("h264", "source"), default="h264")
+    parser.add_argument("--h264-crf", type=int, default=18)
+    parser.add_argument("--h264-preset", default="fast")
+    parser.add_argument("--h264-gop", type=int, default=30)
+    parser.add_argument("--resize-images", action="store_true")
     parser.add_argument("--report-path", type=Path, default=Path("idle_cleaning_report.json"))
     parser.add_argument("--write", action="store_true", help="Create the cleaned dataset")
     parser.add_argument("--output-repo-id", help="Required with --write")
@@ -440,6 +544,10 @@ def main() -> None:
         raise ValueError("--output-repo-id and --output-root are required with --write")
     if args.write and args.output_root.exists():
         raise FileExistsError(f"Output root already exists: {args.output_root}")
+    if args.decode_batch_size <= 0:
+        raise ValueError("--decode-batch-size must be positive")
+    if args.image_writer_threads < 0:
+        raise ValueError("--image-writer-threads must be non-negative")
 
     source = LeRobotDataset(args.repo_id, root=args.root, return_uint8=True, video_backend=args.video_backend)
     plans, report = analyze_dataset(
@@ -452,21 +560,48 @@ def main() -> None:
         smooth_window=args.smooth_window,
     )
 
-    report["config"]["video_backend"] = args.video_backend
+    report["config"].update(
+        {
+            "video_backend": args.video_backend,
+            "decode_batch_size": args.decode_batch_size,
+            "image_writer_threads": args.image_writer_threads,
+            "output_video_codec": args.output_video_codec,
+            "h264_crf": args.h264_crf,
+            "h264_preset": args.h264_preset,
+            "h264_gop": args.h264_gop,
+            "resize_images": args.resize_images,
+            "output_resolution": {
+                key: list((224, 224) if args.resize_images else feature["shape"][:2])
+                for key, feature in source.meta.features.items()
+                if feature["dtype"] in {"image", "video"} and key not in source.meta.depth_keys
+            },
+        }
+    )
 
     if args.write:
+        write_started = time.perf_counter()
         cleaned = rebuild_dataset(
             source,
             plans,
             output_repo_id=args.output_repo_id,
             output_root=args.output_root,
+            decode_batch_size=args.decode_batch_size,
+            image_writer_threads=args.image_writer_threads,
+            output_video_codec=args.output_video_codec,
+            h264_crf=args.h264_crf,
+            h264_preset=args.h264_preset,
+            h264_gop=args.h264_gop,
+            resize_images=args.resize_images,
         )
+        write_seconds = time.perf_counter() - write_started
         report["cleaned_actual"] = {
             "repo_id": cleaned.repo_id,
             "root": str(cleaned.root),
             "episodes": cleaned.meta.total_episodes,
             "frames": cleaned.meta.total_frames,
             "duration_s": cleaned.meta.total_frames / cleaned.meta.fps,
+            "write_seconds": write_seconds,
+            "effective_fps": cleaned.meta.total_frames / write_seconds if write_seconds else None,
         }
         estimate = report["cleaned_estimate"]
         if (
